@@ -3,7 +3,7 @@
 --   * Trinket ESP
 --   * Last looted timers (Castle Rock, Temple of Fire, Deep Sunken, Crypt of Kings)
 --   * Better mana charge: hold G and charging restarts by itself whenever it gets interrupted
---   * Hold block (F): keeps re-sending Block while F is held (needs Matcha Pro / FireServer)
+--   * Hold block (F): keeps sending Block every frame while F is held (needs Matcha Pro / FireServer)
 -- Settings live in Matcha's menu, tab "Alan Hub".
 --
 -- Spectate:  right-click a leaderboard name to spectate, again to stop, another name to switch.
@@ -1148,67 +1148,60 @@ local function manaFrame(active)
 end
 
 --====================================================================
--- HOLD BLOCK (F)  - same as the executor version
--- While F is held (not while typing in chat), fire the character's
--- CharacterHandler.Remotes.Block with (false) every frame, or every "Block delay" ms.
+-- HOLD BLOCK (F)  - same idea as the executor version
+-- While F is held, fire the character's CharacterHandler.Remotes.Block with (false) every
+-- frame (or every "Block delay" ms), so the block goes up the moment stun ends.
+-- Tuned for Matcha: runs FIRST every frame, reads the live key state (no emulated input
+-- events), and keeps the Block remote cached (re-found on respawn) so a frame costs one send.
 -- Sending remotes needs FireServer, which Matcha only has in Pro / Hybrid mode.
 --====================================================================
 local KEY_F = 0x46
-local block = { holding = false, last = 0, events = false, status = "off", pushNext = 0 }
+local block = { last = 0, status = "off", pushNext = 0, remote = nil, char = nil, checkAt = 0, fails = 0 }
 local blockConns = {}
 
-pcall(function()
-    local UIS = game:GetService("UserInputService")
-    local c1 = safeConnect(UIS, "InputBegan", function(input, processed)
-        pcall(function()
-            if not processed and input.KeyCode == Enum.KeyCode.F then block.holding = true end
-        end)
-    end)
-    local c2 = safeConnect(UIS, "InputEnded", function(input)
-        pcall(function()
-            if input.KeyCode == Enum.KeyCode.F then block.holding = false end
-        end)
-    end)
-    blockConns = { c1, c2 }
-    block.events = (c1 ~= nil and c2 ~= nil)
-end)
+-- cached Block remote; re-checked every 0.5s and whenever a send fails
+local function getBlockRemote(now)
+    if block.remote and now < block.checkAt then return block.remote end
+    block.checkAt = now + 0.5
+    local char = myModel()
+    if block.remote and char == block.char and prop(block.remote, "Parent") then return block.remote end
+    block.char = char
+    local handler = char and char:FindFirstChild("CharacterHandler")
+    local remotes = handler and handler:FindFirstChild("Remotes")
+    block.remote = remotes and remotes:FindFirstChild("Block") or nil
+    return block.remote
+end
 
 local function blockFrame(active)
     if not ui("block_on") then
         block.status = "off"
         return
     end
-    local holding
-    if block.events then
-        holding = block.holding
-    else
-        holding = active and iskeypressed(KEY_F)    -- fallback if input events are unavailable
-    end
-    if not holding then
-        if block.status == "blocking" then block.status = "ready" end
-        if block.status == "off" then block.status = "ready" end
+    local now = tick()
+    if not (active and iskeypressed(KEY_F)) then
+        block.status = "ready"
+        getBlockRemote(now)                         -- keep it warm so the first press is instant
         return
     end
 
     local delay = (tonumber(ui("block_delay")) or 0) / 1000
-    local now = tick()
-    if now - block.last < delay then return end
+    if delay > 0 and now - block.last < delay then return end
 
-    local char = myModel()
-    local handler = char and char:FindFirstChild("CharacterHandler")
-    local remotes = handler and handler:FindFirstChild("Remotes")
-    local remote = remotes and remotes:FindFirstChild("Block")
+    local remote = getBlockRemote(now)
     if not remote then
         block.status = "Block remote not found"
         return
     end
     local ok = pcall(function() remote:FireServer(false) end)
+    block.last = now
     if ok then
+        block.fails = 0
         block.status = "blocking"
     else
-        block.status = "FireServer failed - needs Matcha Pro"
+        block.remote = nil                          -- maybe stale after a respawn: find it again
+        block.fails = block.fails + 1
+        if block.fails >= 3 then block.status = "FireServer failed - needs Matcha Pro" end
     end
-    block.last = now
 end
 
 --====================================================================
@@ -1218,11 +1211,11 @@ local function onFrame()
     if _G.AlanHubGen ~= GEN then return end
     local active = isrbxactive()
 
+    pcall(blockFrame, active)        -- first: timing matters most here
+    pcall(manaFrame, active)
     pcall(spectateFrame, active)
     pcall(espFrame)
     pcall(updateLootTimers)
-    pcall(manaFrame, active)
-    pcall(blockFrame, active)
     if tick() >= block.pushNext then
         block.pushNext = tick() + 1
         setField("rl_block_status", block.status)
