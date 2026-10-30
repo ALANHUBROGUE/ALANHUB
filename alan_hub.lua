@@ -2,6 +2,7 @@
 --   * Leaderboard spectate (silent)
 --   * Trinket ESP
 --   * Last looted timers (Castle Rock, Temple of Fire, Deep Sunken, Crypt of Kings)
+--   * Better mana charge: hold G and charging restarts by itself whenever it gets interrupted
 -- Settings live in Matcha's menu, tab "Alan Hub".
 --
 -- Spectate:  right-click a leaderboard name to spectate, again to stop, another name to switch.
@@ -39,7 +40,8 @@ local DEFAULTS = {
     esp_alert     = true,
     esp_range     = 200,
     esp_max       = 60,
-    type_common   = false, type_rare = false, type_mythic = true, type_artifact = true, type_event = false,
+    types_common  = false, types_rare = false, types_mythic = true, types_artifact = true, types_event = false,
+    mana_enabled  = true,
     far_common    = false, far_rare  = false, far_mythic  = true, far_artifact  = true, far_event  = false,
 }
 
@@ -118,6 +120,10 @@ local function renderTab(tab)
     sp:InputText("rl_spec_target", "Spectating", "nobody")
 
 
+    local cb = tab:Section("Combat", "Left")
+    cb:Toggle("rl_mana_enabled", "Better mana charge (hold G)", DEFAULTS.mana_enabled)
+    cb:Tip("While G is held, re-presses G whenever charging gets interrupted")
+
     local lt = tab:Section("Last looted", "Left")
     for i, a in ipairs(LOOT_AREAS) do
         lt:InputText("rl_loot_" .. i, a.label, "...")
@@ -139,7 +145,7 @@ local function renderTab(tab)
         es:SliderInt("rl_esp_max", "Max shown", 5, 100, DEFAULTS.esp_max)
     elseif es.page == 1 then
         for _, r in ipairs(RARITIES) do
-            es:Toggle("rl_type_" .. r, RARITY_LABEL[r], DEFAULTS["type_" .. r])
+            es:Toggle("rl_types_" .. r, RARITY_LABEL[r], DEFAULTS["types_" .. r])
         end
     else
         for _, r in ipairs(RARITIES) do
@@ -816,7 +822,7 @@ local function precheck(e, camPos, maxRange)
     if not pos then hideEsp(e); return false end
     e.pos = pos
     e.dist = (camPos - pos).Magnitude
-    if not ui("type_" .. e.rarity) then hideEsp(e); return false end
+    if not ui("types_" .. e.rarity) then hideEsp(e); return false end
     if not ui("far_" .. e.rarity) and e.dist >= maxRange then hideEsp(e); return false end
     return true
 end
@@ -1079,6 +1085,61 @@ local function updateLootTimers()
 end
 
 --====================================================================
+-- BETTER MANA CHARGE
+-- While you hold G, Rogue Lineage puts a "Charge" object on your character. If charging
+-- stops while G is still held (hit, stunned, pressed too early), the game will not restart
+-- it until G is pressed again. This re-presses G for you (Matcha keyrelease/keypress), with
+-- the same timing as the executor version: ~0.1s plus your ping.
+--====================================================================
+local KEY_G = 0x47
+local mana = { heldSince = nil, nextTry = 0, phase = nil, phaseAt = 0 }
+
+local function pingDelay()
+    local ok, ms = pcall(GetPingValue)
+    if ok and type(ms) == "number" and ms > 0 and ms < 2000 then return ms / 900 end
+    return 0
+end
+
+local function isCharging()
+    local m = myModel()
+    return m ~= nil and m:FindFirstChild("Charge") ~= nil
+end
+
+local function manaFrame(active)
+    local now = tick()
+
+    -- step 2 of a re-press: key down again a moment after our release. Runs before the
+    -- "is G held" check, because our own release may briefly read as G not held.
+    if mana.phase == "released" then
+        if now >= mana.phaseAt then
+            pcall(keypress, KEY_G)
+            mana.phase = nil
+            mana.nextTry = now + 0.1 + pingDelay()   -- give the game time to add "Charge"
+        end
+        return
+    end
+
+    local held = iskeypressed(KEY_G)
+    if not ui("mana_enabled") or not active or not held then
+        mana.heldSince = nil
+        return
+    end
+    if not mana.heldSince then
+        mana.heldSince = now
+        mana.nextTry = now + 0.15 + pingDelay()     -- let the game start charging from your own press
+        return
+    end
+
+    if now < mana.nextTry then return end
+    if isCharging() then return end
+
+    -- step 1: release G so the game sees a fresh press
+    pcall(keyrelease, KEY_G)
+    mana.phase = "released"
+    mana.phaseAt = now + 0.03
+end
+
+--====================================================================
 -- MAIN LOOP
 --====================================================================
 local function onFrame()
@@ -1088,6 +1149,7 @@ local function onFrame()
     pcall(spectateFrame, active)
     pcall(espFrame)
     pcall(updateLootTimers)
+    pcall(manaFrame, active)
 end
 
 local frameConn = safeConnect(RunService, "RenderStepped", onFrame)
