@@ -37,9 +37,9 @@ local DEFAULTS = {
     esp_enabled   = true,
     esp_area      = true,
     esp_alert     = true,
-    esp_range     = 75,
-    esp_max       = 30,
-    type_common   = true,  type_rare = true,  type_mythic = true, type_artifact = true, type_event = true,
+    esp_range     = 200,
+    esp_max       = 60,
+    type_common   = false, type_rare = false, type_mythic = true, type_artifact = true, type_event = false,
     far_common    = false, far_rare  = false, far_mythic  = true, far_artifact  = true, far_event  = false,
 }
 
@@ -87,6 +87,19 @@ local target = nil          -- who is being spectated (set by the spectate code 
 local lootLines = {}        -- "Last looted" lines shown in the menu (filled by the timer code below)
 local lootStatus = ""       -- clock source + last refresh, shown under the timers
 local refreshLoot, printLoot -- assigned below
+
+local LOOT_AREAS = {
+    { label = "Castle Rock",    trigger = "CastleRockSnake" },
+    { label = "Temple of Fire", trigger = "MazeSnakes" },
+    { label = "Deep Sunken",    trigger = "evileye2" },
+    { label = "Crypt of Kings", trigger = "CryptTrigger" },
+}
+
+-- Matcha's menu does not redraw sec:Text() labels, so live values are shown in
+-- InputText fields and pushed with UI.SetValue (documented to update a widget).
+local function setField(id, value)
+    pcall(UI.SetValue, id, value)
+end
 local stopSpectate          -- assigned below
 
 --====================================================================
@@ -102,16 +115,14 @@ local function renderTab(tab)
     sp:Button("Stop spectating", function()
         if stopSpectate then stopSpectate() end
     end)
-    sp:Text(target and ("Spectating: " .. tostring(target)) or "Not spectating")
+    sp:InputText("rl_spec_target", "Spectating", "nobody")
 
 
     local lt = tab:Section("Last looted", "Left")
-    if #lootLines == 0 then
-        lt:Text("Loading...")
-    else
-        for _, line in ipairs(lootLines) do lt:Text(line) end
+    for i, a in ipairs(LOOT_AREAS) do
+        lt:InputText("rl_loot_" .. i, a.label, "...")
     end
-    if lootStatus ~= "" then lt:Text(lootStatus) end
+    lt:InputText("rl_loot_status", "Status", "...")
     lt:Button("Refresh", function()
         if refreshLoot then refreshLoot() end
     end)
@@ -941,12 +952,6 @@ end
 -- newest LastSpawned of ALL triggers (mobs spawn all over the map all the time), advanced
 -- with tick() - so the timers still work, marked with "~".
 --====================================================================
-local LOOT_AREAS = {
-    { label = "Castle Rock",    trigger = "CastleRockSnake" },
-    { label = "Temple of Fire", trigger = "MazeSnakes" },
-    { label = "Deep Sunken",    trigger = "evileye2" },
-    { label = "Crypt of Kings", trigger = "CryptTrigger" },
-}
 local LOOT_REFRESH = 5          -- seconds between automatic refreshes
 
 local lootValues = {}           -- [trigger] = LastSpawned value from the last read
@@ -1007,12 +1012,14 @@ local function buildLines(found)
     if not found then
         lootLines = { "Not available on this server" }
         lootStatus = ""
+        for i = 1, #LOOT_AREAS do setField("rl_loot_" .. i, "not on this server") end
+        setField("rl_loot_status", "MonsterSpawns not found")
         return
     end
     local now, source = nowUnix()
     local mark = (source == "estimated") and "~" or ""
     local lines = {}
-    for _, a in ipairs(LOOT_AREAS) do
+    for i, a in ipairs(LOOT_AREAS) do
         local v = lootValues[a.trigger]
         local text
         if not v then
@@ -1024,9 +1031,11 @@ local function buildLines(found)
             if diff > 2592000 then text = "?" else text = mark .. agoText(diff) end
         end
         lines[#lines + 1] = a.label .. ": " .. text
+        setField("rl_loot_" .. i, text)
     end
     lootLines = lines
     lootStatus = "clock: " .. source .. "  |  read " .. math.floor(tick() - lootReadAt) .. "s ago"
+    setField("rl_loot_status", lootStatus)
 end
 
 local lootFound = false
@@ -1056,6 +1065,9 @@ end
 local lootTextNext = 0
 local function updateLootTimers()
     local now = tick()
+    if now >= lootTextNext then
+        setField("rl_spec_target", target and tostring(target) or "nobody")
+    end
     if now >= lootNext then
         lootNext = now + LOOT_REFRESH
         pcall(doRefresh)
