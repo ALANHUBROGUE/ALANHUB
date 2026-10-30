@@ -85,6 +85,8 @@ local clock = (os and os.clock) or tick
 
 local target = nil          -- who is being spectated (set by the spectate code below)
 local lootLines = {}        -- "Last looted" lines shown in the menu (filled by the timer code below)
+local lootStatus = ""       -- clock source + last refresh, shown under the timers
+local refreshLoot, printLoot -- assigned below
 local stopSpectate          -- assigned below
 
 --====================================================================
@@ -109,6 +111,13 @@ local function renderTab(tab)
     else
         for _, line in ipairs(lootLines) do lt:Text(line) end
     end
+    if lootStatus ~= "" then lt:Text(lootStatus) end
+    lt:Button("Refresh", function()
+        if refreshLoot then refreshLoot() end
+    end)
+    lt:Button("Print to console", function()
+        if printLoot then printLoot() end
+    end)
 
     local es = tab:Section("Trinket ESP", "Right", { "Main", "Types", "Ignore range" })
     if es.page == 0 then
@@ -924,8 +933,13 @@ end
 
 --====================================================================
 -- LAST LOOTED TIMERS
--- Rogue Lineage stores when each area was last looted in
--- workspace.MonsterSpawns.Triggers.<trigger>.LastSpawned (a Unix timestamp).
+-- Rogue Lineage stores, for every monster spawn trigger, when it last spawned its mobs:
+-- workspace.MonsterSpawns.Triggers.<trigger>.LastSpawned (a Unix timestamp, in seconds).
+-- The four loot areas are four of those triggers. Walking in / triggering the mobs resets them.
+--
+-- "Now" comes from os.time() when Matcha provides it. Otherwise it is ESTIMATED from the
+-- newest LastSpawned of ALL triggers (mobs spawn all over the map all the time), advanced
+-- with tick() - so the timers still work, marked with "~".
 --====================================================================
 local LOOT_AREAS = {
     { label = "Castle Rock",    trigger = "CastleRockSnake" },
@@ -933,54 +947,123 @@ local LOOT_AREAS = {
     { label = "Deep Sunken",    trigger = "evileye2" },
     { label = "Crypt of Kings", trigger = "CryptTrigger" },
 }
-local lootSeen = {}   -- fallback when os.time is unavailable: [trigger] = { value, at }
-local lootNext = 0
+local LOOT_REFRESH = 5          -- seconds between automatic refreshes
 
-local function unixNow()
+local lootValues = {}           -- [trigger] = LastSpawned value from the last read
+local lootReadAt = 0            -- tick() of the last read
+local lootNext = 0
+local est = nil                 -- estimated clock: { unix = n, at = tick() }
+
+local function osNow()
     local ok, t = pcall(function() return os.time() end)
     if ok and type(t) == "number" and t > 1500000000 then return t end
     return nil
 end
 
+local function valueOf(trigger)
+    local v = trigger and trigger:FindFirstChild("LastSpawned")
+    local n = v and prop(v, "Value")
+    if type(n) == "string" then n = tonumber(n) end
+    if type(n) == "number" and n > 1500000000 then return n end
+    return nil
+end
+
+-- reads the four areas, and (only when os.time is missing) the newest spawn time of all triggers
+local function readLoot(triggers, needEstimate)
+    for _, a in ipairs(LOOT_AREAS) do
+        lootValues[a.trigger] = valueOf(triggers:FindFirstChild(a.trigger))
+    end
+    if needEstimate then
+        local newest = nil
+        for _, trig in ipairs(triggers:GetChildren()) do
+            local n = valueOf(trig)
+            if n and (not newest or n > newest) then newest = n end
+        end
+        if newest then
+            local advanced = est and (est.unix + (tick() - est.at)) or nil
+            if not advanced or newest > advanced then
+                est = { unix = newest, at = tick() }
+            end
+        end
+    end
+    lootReadAt = tick()
+end
+
+local function nowUnix()
+    local t = osNow()
+    if t then return t, "os.time" end
+    if est then return est.unix + (tick() - est.at), "estimated" end
+    return nil, "none"
+end
+
 local function agoText(seconds)
+    if seconds < 0 then seconds = 0 end
     local m = math.floor(seconds / 60)
     if m >= 60 then return math.floor(m / 60) .. "h " .. (m % 60) .. "m ago" end
     return m .. "m ago"
 end
 
-local function updateLootTimers()
-    if tick() < lootNext then return end
-    lootNext = tick() + 1
-    local spawns = Workspace:FindFirstChild("MonsterSpawns")
-    local triggers = spawns and spawns:FindFirstChild("Triggers")
-    if not triggers then
+local function buildLines(found)
+    if not found then
         lootLines = { "Not available on this server" }
+        lootStatus = ""
         return
     end
-    local now = unixNow()
+    local now, source = nowUnix()
+    local mark = (source == "estimated") and "~" or ""
     local lines = {}
     for _, a in ipairs(LOOT_AREAS) do
-        local text = "unknown"
-        local trig = triggers:FindFirstChild(a.trigger)
-        local val = trig and trig:FindFirstChild("LastSpawned")
-        local v = val and prop(val, "Value")
-        if type(v) == "number" and v > 0 then
-            if now then
-                local diff = now - v
-                if diff >= 0 and diff < 2592000 then text = agoText(diff) else text = "?" end
-            else
-                -- no real clock: start timing when the value changes (the area gets looted)
-                local seen = lootSeen[a.trigger]
-                if not seen or seen.value ~= v then
-                    lootSeen[a.trigger] = { value = v, at = seen and tick() or nil }
-                    seen = lootSeen[a.trigger]
-                end
-                text = seen.at and agoText(tick() - seen.at) or "waiting for next loot"
-            end
+        local v = lootValues[a.trigger]
+        local text
+        if not v then
+            text = "no data"
+        elseif not now then
+            text = "no clock"
+        else
+            local diff = now - v
+            if diff > 2592000 then text = "?" else text = mark .. agoText(diff) end
         end
         lines[#lines + 1] = a.label .. ": " .. text
     end
     lootLines = lines
+    lootStatus = "clock: " .. source .. "  |  read " .. math.floor(tick() - lootReadAt) .. "s ago"
+end
+
+local lootFound = false
+
+local function doRefresh()
+    local spawns = Workspace:FindFirstChild("MonsterSpawns")
+    local triggers = spawns and spawns:FindFirstChild("Triggers")
+    lootFound = triggers ~= nil
+    if triggers then readLoot(triggers, osNow() == nil) end
+    buildLines(lootFound)
+end
+
+refreshLoot = function()
+    lootNext = 0
+    pcall(doRefresh)
+    lootNext = tick() + LOOT_REFRESH
+end
+
+printLoot = function()
+    pcall(doRefresh)
+    print("[Alan Hub] Last looted:")
+    for _, line in ipairs(lootLines) do print("  " .. line) end
+    if lootStatus ~= "" then print("  " .. lootStatus) end
+end
+
+-- every frame: re-read the game every LOOT_REFRESH seconds, rebuild the text every second
+local lootTextNext = 0
+local function updateLootTimers()
+    local now = tick()
+    if now >= lootNext then
+        lootNext = now + LOOT_REFRESH
+        pcall(doRefresh)
+        lootTextNext = now + 1
+    elseif now >= lootTextNext then
+        lootTextNext = now + 1
+        pcall(buildLines, lootFound)
+    end
 end
 
 --====================================================================
