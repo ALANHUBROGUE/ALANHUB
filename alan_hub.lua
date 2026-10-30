@@ -1095,12 +1095,19 @@ end
 -- BETTER MANA CHARGE
 -- While you hold G, Rogue Lineage puts a "Charge" object on your character. If charging
 -- stops while G is still held (hit, stunned, pressed too early), the game will not restart
--- it until G is pressed again. This re-presses G for you (Matcha keyrelease/keypress), with
--- the same timing as the executor version: checks every frame, waits 0.1s + ping/900 after
--- each (re)start of charging.
+-- it until G is pressed again. This re-presses G for you (Matcha keyrelease/keypress).
+-- Timing is tuned for key presses (the executor version fires the remote instead):
+--   * first check 0.15s + ping after you press G (the game needs a moment to add "Charge")
+--   * 30ms between release and re-press, so Roblox registers both
+--   * "Charge" must be missing for MANA_CONFIRM seconds before re-pressing, so one bad read
+--     never makes it release G while you are actually charging
+--   * 0.1s + ping/900 after each re-press before checking again
 --====================================================================
 local KEY_G = 0x47
-local mana = { heldSince = nil, nextTry = 0, phase = nil, phaseAt = 0 }
+local mana = { heldSince = nil, nextTry = 0, phase = nil, phaseAt = 0, missingSince = nil }
+local MANA_FIRST   = 0.15   -- seconds after your own press before the first check
+local MANA_GAP     = 0.03   -- seconds between release and re-press
+local MANA_CONFIRM = 0.05   -- "Charge" must be missing this long before re-pressing
 
 local function pingDelay()
     local ok, ms = pcall(GetPingValue)
@@ -1130,21 +1137,33 @@ local function manaFrame(active)
     local held = iskeypressed(KEY_G)
     if not ui("mana_on") or not active or not held then
         mana.heldSince = nil
+        mana.missingSince = nil
         return
     end
     if not mana.heldSince then
         mana.heldSince = now
-        mana.nextTry = now + 0.1 + pingDelay()      -- original: 0.1s + ping/900 after the first charge
+        mana.nextTry = now + MANA_FIRST + pingDelay()
+        mana.missingSince = nil
         return
     end
 
     if now < mana.nextTry then return end
-    if isCharging() then return end
+    if isCharging() then
+        mana.missingSince = nil
+        return
+    end
+    -- debounce: only act when "Charge" has been gone for a moment (and more than one check)
+    if not mana.missingSince then
+        mana.missingSince = now
+        return
+    end
+    if now - mana.missingSince < MANA_CONFIRM then return end
 
     -- step 1: release G so the game sees a fresh press
+    mana.missingSince = nil
     pcall(keyrelease, KEY_G)
     mana.phase = "released"
-    mana.phaseAt = now                              -- press again on the very next frame
+    mana.phaseAt = now + MANA_GAP
 end
 
 --====================================================================
