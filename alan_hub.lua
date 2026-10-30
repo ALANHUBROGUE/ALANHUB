@@ -3,6 +3,7 @@
 --   * Trinket ESP
 --   * Last looted timers (Castle Rock, Temple of Fire, Deep Sunken, Crypt of Kings)
 --   * Better mana charge: hold G and charging restarts by itself whenever it gets interrupted
+--   * Hold block (F): keeps re-sending Block while F is held (needs Matcha Pro / FireServer)
 -- Settings live in Matcha's menu, tab "Alan Hub".
 --
 -- Spectate:  right-click a leaderboard name to spectate, again to stop, another name to switch.
@@ -41,7 +42,9 @@ local DEFAULTS = {
     esp_range     = 200,
     esp_max       = 60,
     types_common  = false, types_rare = false, types_mythic = true, types_artifact = true, types_event = false,
-    mana_enabled  = true,
+    mana_on       = false,
+    block_on      = false,
+    block_delay   = 0,
     far_common    = false, far_rare  = false, far_mythic  = true, far_artifact  = true, far_event  = false,
 }
 
@@ -121,8 +124,12 @@ local function renderTab(tab)
 
 
     local cb = tab:Section("Combat", "Left")
-    cb:Toggle("rl_mana_enabled", "Better mana charge (hold G)", DEFAULTS.mana_enabled)
+    cb:Toggle("rl_mana_on", "Better mana charge (hold G)", DEFAULTS.mana_on)
     cb:Tip("While G is held, re-presses G whenever charging gets interrupted")
+    cb:Toggle("rl_block_on", "Hold block (F)", DEFAULTS.block_on)
+    cb:Tip("While F is held, keeps sending Block (needs Matcha Pro / FireServer)")
+    cb:SliderInt("rl_block_delay", "Block delay (ms)", 0, 1000, DEFAULTS.block_delay)
+    cb:InputText("rl_block_status", "Block status", "off")
 
     local lt = tab:Section("Last looted", "Left")
     for i, a in ipairs(LOOT_AREAS) do
@@ -1089,7 +1096,8 @@ end
 -- While you hold G, Rogue Lineage puts a "Charge" object on your character. If charging
 -- stops while G is still held (hit, stunned, pressed too early), the game will not restart
 -- it until G is pressed again. This re-presses G for you (Matcha keyrelease/keypress), with
--- the same timing as the executor version: ~0.1s plus your ping.
+-- the same timing as the executor version: checks every frame, waits 0.1s + ping/900 after
+-- each (re)start of charging.
 --====================================================================
 local KEY_G = 0x47
 local mana = { heldSince = nil, nextTry = 0, phase = nil, phaseAt = 0 }
@@ -1120,13 +1128,13 @@ local function manaFrame(active)
     end
 
     local held = iskeypressed(KEY_G)
-    if not ui("mana_enabled") or not active or not held then
+    if not ui("mana_on") or not active or not held then
         mana.heldSince = nil
         return
     end
     if not mana.heldSince then
         mana.heldSince = now
-        mana.nextTry = now + 0.15 + pingDelay()     -- let the game start charging from your own press
+        mana.nextTry = now + 0.1 + pingDelay()      -- original: 0.1s + ping/900 after the first charge
         return
     end
 
@@ -1136,7 +1144,71 @@ local function manaFrame(active)
     -- step 1: release G so the game sees a fresh press
     pcall(keyrelease, KEY_G)
     mana.phase = "released"
-    mana.phaseAt = now + 0.03
+    mana.phaseAt = now                              -- press again on the very next frame
+end
+
+--====================================================================
+-- HOLD BLOCK (F)  - same as the executor version
+-- While F is held (not while typing in chat), fire the character's
+-- CharacterHandler.Remotes.Block with (false) every frame, or every "Block delay" ms.
+-- Sending remotes needs FireServer, which Matcha only has in Pro / Hybrid mode.
+--====================================================================
+local KEY_F = 0x46
+local block = { holding = false, last = 0, events = false, status = "off", pushNext = 0 }
+local blockConns = {}
+
+pcall(function()
+    local UIS = game:GetService("UserInputService")
+    local c1 = safeConnect(UIS, "InputBegan", function(input, processed)
+        pcall(function()
+            if not processed and input.KeyCode == Enum.KeyCode.F then block.holding = true end
+        end)
+    end)
+    local c2 = safeConnect(UIS, "InputEnded", function(input)
+        pcall(function()
+            if input.KeyCode == Enum.KeyCode.F then block.holding = false end
+        end)
+    end)
+    blockConns = { c1, c2 }
+    block.events = (c1 ~= nil and c2 ~= nil)
+end)
+
+local function blockFrame(active)
+    if not ui("block_on") then
+        block.status = "off"
+        return
+    end
+    local holding
+    if block.events then
+        holding = block.holding
+    else
+        holding = active and iskeypressed(KEY_F)    -- fallback if input events are unavailable
+    end
+    if not holding then
+        if block.status == "blocking" then block.status = "ready" end
+        if block.status == "off" then block.status = "ready" end
+        return
+    end
+
+    local delay = (tonumber(ui("block_delay")) or 0) / 1000
+    local now = tick()
+    if now - block.last < delay then return end
+
+    local char = myModel()
+    local handler = char and char:FindFirstChild("CharacterHandler")
+    local remotes = handler and handler:FindFirstChild("Remotes")
+    local remote = remotes and remotes:FindFirstChild("Block")
+    if not remote then
+        block.status = "Block remote not found"
+        return
+    end
+    local ok = pcall(function() remote:FireServer(false) end)
+    if ok then
+        block.status = "blocking"
+    else
+        block.status = "FireServer failed - needs Matcha Pro"
+    end
+    block.last = now
 end
 
 --====================================================================
@@ -1150,6 +1222,11 @@ local function onFrame()
     pcall(espFrame)
     pcall(updateLootTimers)
     pcall(manaFrame, active)
+    pcall(blockFrame, active)
+    if tick() >= block.pushNext then
+        block.pushNext = tick() + 1
+        setField("rl_block_status", block.status)
+    end
 end
 
 local frameConn = safeConnect(RunService, "RenderStepped", onFrame)
@@ -1186,6 +1263,7 @@ local function cleanup()
     espList = {}
     for _, n in ipairs(notifs) do pcall(removeNotif, n) end
     notifs = {}
+    for _, c in ipairs(blockConns) do pcall(function() c:Disconnect() end) end
     pcall(UI.RemoveTab, TAB_NAME)
 end
 
