@@ -3,7 +3,7 @@
 --   * Trinket ESP
 --   * Last looted timers (Castle Rock, Temple of Fire, Deep Sunken, Crypt of Kings)
 --   * Better mana charge: hold G and charging restarts by itself whenever it gets interrupted
---   * Hold block (F): keeps sending Block every frame while F is held (needs Matcha Pro / FireServer)
+--   * Hold block (F): hold F through stun and the block goes up the moment it can
 -- Settings live in Matcha's menu, tab "Alan Hub".
 --
 -- Spectate:  right-click a leaderboard name to spectate, again to stop, another name to switch.
@@ -44,6 +44,7 @@ local DEFAULTS = {
     types_common  = false, types_rare = false, types_mythic = true, types_artifact = true, types_event = false,
     mana_on       = false,
     block_on      = false,
+    block_remote  = false,
     block_delay   = 0,
     far_common    = false, far_rare  = false, far_mythic  = true, far_artifact  = true, far_event  = false,
 }
@@ -127,8 +128,10 @@ local function renderTab(tab)
     cb:Toggle("rl_mana_on", "Better mana charge (hold G)", DEFAULTS.mana_on)
     cb:Tip("While G is held, re-presses G whenever charging gets interrupted")
     cb:Toggle("rl_block_on", "Hold block (F)", DEFAULTS.block_on)
-    cb:Tip("While F is held, keeps sending Block (needs Matcha Pro / FireServer)")
-    cb:SliderInt("rl_block_delay", "Block delay (ms)", 0, 1000, DEFAULTS.block_delay)
+    cb:Tip("Hold F through stun: re-presses F the moment you can block again")
+    cb:Toggle("rl_block_remote", "Also send Block remote (Pro)", DEFAULTS.block_remote)
+    cb:Tip("Executor-style: sends Block every frame. Needs Matcha Pro / Hybrid FireServer")
+    cb:SliderInt("rl_block_delay", "Remote delay (ms)", 0, 1000, DEFAULTS.block_delay)
     cb:InputText("rl_block_status", "Block status", "off")
 
     local lt = tab:Section("Last looted", "Left")
@@ -1167,18 +1170,31 @@ local function manaFrame(active)
 end
 
 --====================================================================
--- HOLD BLOCK (F)  - same idea as the executor version
--- While F is held, fire the character's CharacterHandler.Remotes.Block with (false) every
--- frame (or every "Block delay" ms), so the block goes up the moment stun ends.
--- Tuned for Matcha: runs FIRST every frame, reads the live key state (no emulated input
--- events), and keeps the Block remote cached (re-found on respawn) so a frame costs one send.
--- Sending remotes needs FireServer, which Matcha only has in Pro / Hybrid mode.
+-- HOLD BLOCK (F)
+-- Rogue Lineage puts a "Blocking" object on your character while you block and a "Stun"
+-- object while you are stunned. The game only starts a block on a fresh F press, so
+-- holding F through a stun does nothing by itself. While F is held this:
+--   * does nothing while "Blocking" is there
+--   * waits while "Stun" is there, and re-presses F the moment it disappears
+--   * otherwise re-presses F until "Blocking" appears ("Blocking" must be missing for
+--     BLOCK_CONFIRM first, so one bad read never drops a real block)
+-- Re-press = keyrelease, then keypress BLOCK_GAP later (Matcha input, no remotes).
+-- Optional: also fire CharacterHandler.Remotes.Block like the executor version (Pro only).
 --====================================================================
 local KEY_F = 0x46
-local block = { last = 0, status = "off", pushNext = 0, remote = nil, char = nil, checkAt = 0, fails = 0 }
+local BLOCK_FIRST   = 0.1    -- after your own F press: give the game this long (+ping) to block
+local BLOCK_GAP     = 0.03   -- release -> press
+local BLOCK_CONFIRM = 0.05   -- "Blocking" missing this long before re-pressing (skipped right after stun)
+local BLOCK_RETRY   = 0.08   -- after a re-press: wait this long (+ping) for "Blocking" to appear
+
+local block = {
+    status = "off", pushNext = 0,
+    heldSince = nil, phase = nil, phaseAt = 0, nextTry = 0, missingSince = nil, wasStunned = false,
+    last = 0, remote = nil, char = nil, checkAt = 0, fails = 0,
+}
 local blockConns = {}
 
--- cached Block remote; re-checked every 0.5s and whenever a send fails
+-- optional executor-style remote (cached; re-found on respawn or failed send)
 local function getBlockRemote(now)
     if block.remote and now < block.checkAt then return block.remote end
     block.checkAt = now + 0.5
@@ -1191,36 +1207,91 @@ local function getBlockRemote(now)
     return block.remote
 end
 
-local function blockFrame(active)
-    if not ui("block_on") then
-        block.status = "off"
-        return
-    end
-    local now = tick()
-    if not (active and iskeypressed(KEY_F)) then
-        block.status = "ready"
-        getBlockRemote(now)                         -- keep it warm so the first press is instant
-        return
-    end
-
+local function sendBlockRemote(now)
     local delay = (tonumber(ui("block_delay")) or 0) / 1000
     if delay > 0 and now - block.last < delay then return end
-
     local remote = getBlockRemote(now)
-    if not remote then
-        block.status = "Block remote not found"
-        return
-    end
+    if not remote then return end
     local ok = pcall(function() remote:FireServer(false) end)
     block.last = now
     if ok then
         block.fails = 0
-        block.status = "blocking"
     else
-        block.remote = nil                          -- maybe stale after a respawn: find it again
+        block.remote = nil
         block.fails = block.fails + 1
-        if block.fails >= 3 then block.status = "FireServer failed - needs Matcha Pro" end
     end
+end
+
+local function blockFrame(active)
+    local now = tick()
+
+    -- second half of a re-press (runs before the "is F held" check: our own release
+    -- may briefly read as F not held)
+    if block.phase == "released" then
+        if now >= block.phaseAt then
+            pcall(keypress, KEY_F)
+            block.phase = nil
+            block.nextTry = now + BLOCK_RETRY + pingDelay()
+        end
+        return
+    end
+
+    if not ui("block_on") then
+        block.status = "off"
+        block.heldSince = nil
+        return
+    end
+
+    if not (active and iskeypressed(KEY_F)) then
+        block.status = "ready (hold F)"
+        block.heldSince = nil
+        block.missingSince = nil
+        block.wasStunned = false
+        if ui("block_remote") then getBlockRemote(now) end
+        return
+    end
+
+    if ui("block_remote") then pcall(sendBlockRemote, now) end
+
+    local m = myModel()
+    if not m then
+        block.status = "no character"
+        return
+    end
+    if not block.heldSince then
+        block.heldSince = now
+        block.nextTry = now + BLOCK_FIRST + pingDelay()
+        return
+    end
+
+    if m:FindFirstChild("Blocking") then
+        block.status = "blocking"
+        block.missingSince = nil
+        block.wasStunned = false
+        return
+    end
+    if m:FindFirstChild("Stun") then
+        block.status = "stunned - blocks when it ends"
+        block.wasStunned = true
+        return
+    end
+
+    local stunJustEnded = block.wasStunned
+    block.wasStunned = false
+    if not stunJustEnded then
+        if now < block.nextTry then return end
+        if not block.missingSince then
+            block.missingSince = now
+            return
+        end
+        if now - block.missingSince < BLOCK_CONFIRM then return end
+    end
+
+    block.missingSince = nil
+    block.status = "re-pressing F"
+    pcall(keyrelease, KEY_F)
+    block.phase = "released"
+    block.phaseAt = now + BLOCK_GAP
 end
 
 --====================================================================
