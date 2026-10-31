@@ -1250,6 +1250,12 @@ end
 -- If no single remote matches (or FireServer fails) the key re-press version below is used.
 --====================================================================
 local IS_GAIA = (game.PlaceId == 5208655184)
+
+-- Mana remotes confirmed with Matcha's Remote Spy (holding / releasing G). Used first; if a
+-- game update renames it, the pattern search below takes over, then the key version.
+local KNOWN_MANA_REMOTES = {
+    [3541987450] = "5F4EAD79-23A0-4AAE-8F7A-1381A59D3577",
+}
 local GUID_PATTERN = "^%x%x%x%x%x%x%x%x%-%x%x%x%x%-%x%x%x%x%-%x%x%x%x%-%x%x%x%x%x%x%x%x%x%x%x%x$"
 local manaR = { remote = nil, char = nil, checkAt = 0, cands = 0, failed = false,
                 wasHeld = false, charging = false, nextTry = 0 }
@@ -1268,6 +1274,17 @@ local function findManaRemote(now)
     local remotes = handler and handler:FindFirstChild("Remotes")
     if not remotes then return nil end
     local pid = game.PlaceId
+
+    local known = KNOWN_MANA_REMOTES[pid]
+    if known then
+        local k = remotes:FindFirstChild(known)
+        if k and prop(k, "ClassName") == "RemoteEvent" then
+            r.remote = k
+            r.cands = 1
+            return r.remote
+        end
+    end
+
     local found = {}
     for _, c in ipairs(remotes:GetChildren()) do
         if prop(c, "ClassName") == "RemoteEvent" then
