@@ -48,6 +48,7 @@ local DEFAULTS = {
     block_on      = false,
     block_delay   = 0,
     viri_on       = false,
+    viri_time     = 900,    -- ms of F spam at most
     far_common    = false, far_rare  = false, far_mythic  = true, far_artifact  = true, far_event  = false,
 }
 
@@ -137,6 +138,7 @@ local function renderTab(tab)
     cb:InputText("rl_block_status", "Block status", "off")
     cb:Toggle("rl_viri_on", "Anti backfire Viribus", DEFAULTS.viri_on)
     cb:Tip("Left-click Viribus at a backfire mana (not 25-35 / 60-75): spams F to block the pillar")
+    cb:SliderInt("rl_viri_time", "Viribus spam time (ms)", 200, 1500, DEFAULTS.viri_time)
     cb:InputText("rl_viri_status", "Viribus status", "off")
 
     local lt = tab:Section("Last looted", "Left")
@@ -1440,13 +1442,13 @@ end
 --    your character, or your mana drops by VIRI_DROP+. No confirmation (cooldown, cast did
 --    not start) -> nothing is pressed at all.
 -- 3. spam F (press / release) until the cast is over ("ActiveCast" gone), you get stunned,
---    or VIRI_MAX seconds. F is always left released; nothing happens if you hold F yourself.
+--    or the "Viribus spam time". F is always left released; nothing happens if you hold F.
 -- (The executor detects casting with the "Casting" CollectionService tag, which Matcha cannot
 -- read - "ActiveCast" and the mana drop are the readable equivalents.)
 --====================================================================
 local VIRI_PRESS   = 0.05    -- F down time per spam
 local VIRI_GAP     = 0.03    -- F up time between spams
-local VIRI_MAX     = 1.5     -- spam at most this long
+-- spam at most "Viribus spam time" (menu slider, default 0.9s)
 local VIRI_CONFIRM = 0.35    -- seconds (+ping) for the cast to show up after the click
 local VIRI_DROP    = 5       -- mana drop that counts as "the spell was cast"
 
@@ -1485,7 +1487,8 @@ local function viribusWatch(manaAtClick)
     viri.status = "backfire - spamming F"
     local started = tick()
     local sawCast = false
-    while tick() - started < VIRI_MAX do
+    local maxTime = (tonumber(ui("viri_time")) or 900) / 1000
+    while tick() - started < maxTime do
         local m = myModel()
         if not m then break end
         if firstChildOf(m, DISABLE_MARKERS) then break end      -- stunned: stop, don't lock you up
