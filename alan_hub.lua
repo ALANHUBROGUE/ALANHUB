@@ -126,11 +126,11 @@ local function renderTab(tab)
 
 
     local cb = tab:Section("Combat", "Left")
-    cb:Toggle("rl_mana_on", "Better mana charge (hold G)", DEFAULTS.mana_on)
-    cb:Tip("Executor method [PRO NEEDED] when the mana remote is found; otherwise re-presses G")
+    cb:Toggle("rl_mana_on", "Better mana charge (hold G)  [PRO + HYBRID NEEDED]", DEFAULTS.mana_on)
+    cb:Tip("Needs Matcha Pro with Hybrid mode on. Without them it falls back to re-pressing G (less reliable)")
     cb:InputText("rl_mana_status", "Mana status", "off")
-    cb:Toggle("rl_block_on", "Hold block (F)  [PRO NEEDED]", DEFAULTS.block_on)
-    cb:Tip("Hold F through stun / ragdoll / combos: sends Block every frame (executor method)")
+    cb:Toggle("rl_block_on", "Hold block (F)  [PRO + HYBRID NEEDED]", DEFAULTS.block_on)
+    cb:Tip("Needs Matcha Pro with Hybrid mode on. Hold F through stun / ragdoll / combos")
     cb:SliderInt("rl_block_delay", "Block delay (ms)", 0, 1000, DEFAULTS.block_delay)
     cb:InputText("rl_block_status", "Block status", "off")
 
@@ -1122,7 +1122,7 @@ local function blockStep(active)
     if delay <= 0 or now - r.last >= delay then
         if not pcall(function() remote:FireServer(false) end) then
             r.remote = nil
-            r.status = "FireServer error - PRO NEEDED + Hybrid mode"
+            r.status = "FireServer error - PRO + HYBRID NEEDED"
             return
         end
         r.last = now
@@ -1136,7 +1136,7 @@ local function blockStep(active)
     else
         r.freeSince = r.freeSince or now
         if now - r.freeSince > 0.6 then
-            r.status = "sent but no block - PRO NEEDED / Hybrid off?"
+            r.status = "sent but no block - PRO + HYBRID NEEDED"
         end
     end
 end
@@ -1258,7 +1258,8 @@ local KNOWN_MANA_REMOTES = {
 }
 local GUID_PATTERN = "^%x%x%x%x%x%x%x%x%-%x%x%x%x%-%x%x%x%x%-%x%x%x%x%-%x%x%x%x%x%x%x%x%x%x%x%x$"
 local manaR = { remote = nil, char = nil, checkAt = 0, cands = 0, failed = false,
-                wasHeld = false, charging = false, nextTry = 0, sends = 0 }
+                wasHeld = false, charging = false, nextTry = 0, sends = 0,
+                lastTrue = 0, lastFalse = 0, releasedAt = nil, cleanups = 0 }
 
 local function manaValue(m)
     local mv = m and m:FindFirstChild("Mana")
@@ -1323,7 +1324,9 @@ local function manaFire(on)
             remote:FireServer(on and true or false)
         end
     end)
-    if not ok then
+    if ok then
+        if on then manaR.lastTrue = tick() else manaR.lastFalse = tick() end
+    else
         manaR.failed = true
         manaR.remote = nil
         manaR.checkAt = tick() + 5
@@ -1331,11 +1334,19 @@ local function manaFire(on)
     return ok
 end
 
+-- true when the last mana signal the HUB sent was "charge" (so stopping it is our job)
+local function weLeftItCharging()
+    return manaR.lastTrue > manaR.lastFalse
+end
+
 local function manaRemoteFrame(held)
     local now = tick()
     local r = manaR
     if held and not r.wasHeld then                    -- InputBegan G
-        if manaFire(true) then r.charging = true end
+        manaFire(true)
+        r.charging = true
+        r.releasedAt = nil
+        r.cleanups = 0
         r.nextTry = now + 0.1 + manaPing()
     elseif held then
         if now >= r.nextTry then
@@ -1343,12 +1354,29 @@ local function manaRemoteFrame(held)
             local v = manaValue(m)
             if m and not m:FindFirstChild("Charge") and not (v and v >= 98) then
                 manaFire(true)
+                r.charging = true
                 r.nextTry = now + 0.1 + manaPing()
             end
         end
-    elseif r.wasHeld and r.charging then              -- G released
-        manaFire(false)
-        r.charging = false
+    else
+        if r.wasHeld then                             -- G released
+            r.releasedAt = now
+            r.cleanups = 0
+            if r.charging or weLeftItCharging() then manaFire(false) end
+            r.charging = false
+        end
+        -- safety: still charging 0.3s / 0.6s / 0.9s after release, and the hub sent a
+        -- charge during that hold -> send stop again (never touches charges it did not cause)
+        if r.releasedAt and r.cleanups < 3 and now - r.releasedAt >= 0.3 * (r.cleanups + 1)
+            and r.lastTrue >= r.releasedAt - 1 then
+            local m = myModel()
+            if m and m:FindFirstChild("Charge") then
+                r.cleanups = r.cleanups + 1
+                manaFire(false)
+            elseif now - r.releasedAt > 1.5 then
+                r.releasedAt = nil
+            end
+        end
     end
     r.wasHeld = held
 end
@@ -1356,7 +1384,7 @@ end
 local function manaStep(active)
     local now = tick()
     if not ui("mana_on") then
-        if manaR.charging then manaFire(false); manaR.charging = false end
+        if manaR.charging or weLeftItCharging() then manaFire(false); manaR.charging = false end
         manaR.wasHeld = false
         manaFrame(active)                               -- resets the key version, status "off"
         return
@@ -1377,7 +1405,7 @@ local function manaStep(active)
     end
 
     -- fallback: key re-press
-    if manaR.charging then manaFire(false); manaR.charging = false end
+    if manaR.charging or (manaR.remote and weLeftItCharging()) then manaFire(false); manaR.charging = false end
     manaR.wasHeld = false
     manaFrame(active)
     if mana.status ~= "ready" and mana.status ~= "off" then
@@ -1388,7 +1416,7 @@ local function manaStep(active)
     end
     if mana.status == "ready" then
         if manaR.failed then
-            mana.status = "ready (keys) - FireServer failed: PRO NEEDED + Hybrid"
+            mana.status = "ready (keys) - FireServer failed: PRO + HYBRID NEEDED"
         elseif manaR.cands == 0 then
             mana.status = "ready (keys) - mana remote not found"
         else
