@@ -93,6 +93,7 @@ local target = nil          -- who is being spectated (set by the spectate code 
 local lootLines = {}        -- "Last looted" lines shown in the menu (filled by the timer code below)
 local lootStatus = ""       -- clock source + last refresh, shown under the timers
 local refreshLoot, printLoot -- assigned below
+local phoenixAlert          -- assigned below
 
 local LOOT_AREAS = {
     { label = "Castle Rock",    trigger = "CastleRockSnake" },
@@ -152,6 +153,10 @@ local function renderTab(tab)
         es:Toggle("rl_esp_enabled", "Trinket ESP", DEFAULTS.esp_enabled)
         es:Toggle("rl_esp_area", "Show area", DEFAULTS.esp_area)
         es:Toggle("rl_esp_alert", "Phoenix Down alert", DEFAULTS.esp_alert)
+        es:Tip("Sound: turn on Notification sound in Matcha's options")
+        es:Button("Test alert", function()
+            if phoenixAlert then phoenixAlert("test - X:0 Y:0 Z:0") end
+        end)
         es:SliderInt("rl_esp_range", "Range", 10, 300, DEFAULTS.esp_range)
         es:SliderInt("rl_esp_max", "Max shown", 5, 100, DEFAULTS.esp_max)
     elseif es.page == 1 then
@@ -754,6 +759,14 @@ local function updateNotifs()
     notifs = keep
 end
 
+-- Phoenix Down alert: the drawn popup plus a Matcha notification. Matcha cannot create
+-- Sound objects (no Instance.new), but its notifications play a sound when "Notification
+-- sound" is enabled in Matcha's options.
+phoenixAlert = function(posStr)
+    pcall(drawNotif, "Phoenix Down", posStr, RARITY_STYLE.artifact.Color)
+    pcall(notify, "Phoenix Down / Azael Horn - " .. posStr, "Alan Hub", 6)
+end
+
 -- ESP objects
 local espList = {}
 local espByAddress = {}
@@ -787,7 +800,7 @@ local function addTrinketEsp(trinket, name, rarity)
         local pos = safeRead(function() return trinket.Position end)
         local posStr = pos and ("X:" .. math.floor(pos.X) .. " Y:" .. math.floor(pos.Y) .. " Z:" .. math.floor(pos.Z))
             or "unknown position"
-        pcall(drawNotif, "Phoenix Down", posStr, color)
+        phoenixAlert(posStr)
     end
 
     local dot = Drawing.new("Circle")
