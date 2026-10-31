@@ -44,7 +44,7 @@ local DEFAULTS = {
     types_common  = false, types_rare = false, types_mythic = true, types_artifact = true, types_event = false,
     mana_on       = false,
     block_on      = false,
-    block_remote  = false,
+    block_method  = 0,      -- 0 = Keys, 1 = Remote (Matcha Pro)
     block_delay   = 0,
     far_common    = false, far_rare  = false, far_mythic  = true, far_artifact  = true, far_event  = false,
 }
@@ -126,12 +126,12 @@ local function renderTab(tab)
 
     local cb = tab:Section("Combat", "Left")
     cb:Toggle("rl_mana_on", "Better mana charge (hold G)", DEFAULTS.mana_on)
-    cb:Tip("Hold G: charging restarts when a stun/interruption ends")
+    cb:Tip("Hold G: charging (re)starts as soon as it is possible")
     cb:InputText("rl_mana_status", "Mana status", "off")
     cb:Toggle("rl_block_on", "Hold block (F)", DEFAULTS.block_on)
-    cb:Tip("Hold F through stun: blocks the moment the stun ends")
-    cb:Toggle("rl_block_remote", "Also send Block remote (Pro)", DEFAULTS.block_remote)
-    cb:Tip("Executor-style: sends Block every frame. Needs Matcha Pro / Hybrid FireServer")
+    cb:Tip("Hold F through stun / ragdoll / combos: blocks as soon as it is possible")
+    cb:Combo("rl_block_method", "Block method", { "Keys", "Remote (Matcha Pro)" }, DEFAULTS.block_method)
+    cb:Tip("Remote = executor-style, never unblocks you, but needs Matcha Pro / Hybrid")
     cb:SliderInt("rl_block_delay", "Remote delay (ms)", 0, 1000, DEFAULTS.block_delay)
     cb:InputText("rl_block_status", "Block status", "off")
 
@@ -1098,171 +1098,155 @@ end
 --====================================================================
 -- HOLD-TO-BUFFER: better mana charge (G) and hold block (F)
 --
--- Matcha cannot tell the game "charge" / "block" directly (that needs FireServer), so these
--- re-press the key. Every re-press STARTS WITH A RELEASE, which tells the game "stop
--- charging" / "unblock" - so a re-press is only done when something actually interrupted you:
---   1. a blocker (Stun; for mana also ManaStop, ActiveCast, SpellBlocking, Climbing) just
---      ended while you hold the key                       -> re-press immediately
---   2. "Charge" / "Blocking" was there and has been gone for BUF_CONFIRM
---   3. you pressed while unable and it never started      -> one buffered retry
--- Each trigger gets at most BUF_MAX re-presses, BUF_RETRY (+ping) apart, then it waits for the
--- next trigger - so it can never spam. Mana is never re-pressed at 98+ mana.
+-- Goal: hold the key through stun / ragdoll / combos and it activates as soon as the game
+-- allows it. Without Matcha Pro the only tool is re-pressing the key, and every re-press
+-- STARTS WITH A RELEASE (= "unblock" / "stop charging"), so it is only done when you are
+-- reliably NOT blocking / charging:
+--   * marker present ("Blocking" / "Charge", or mana 98+)          -> nothing
+--   * a known disable marker present (Stun, Ragdoll, ...)          -> wait; re-press the
+--     instant it disappears
+--   * anything else (combos, unknown states)                       -> re-press every
+--     HOLD_RETRY (+ping) until the game confirms - never gives up
+--   * "not active" only counts after HOLD_ABSENT_FRAMES frames AND HOLD_ABSENT_TIME in a row,
+--     and never during HOLD_GRACE (+ping) after any press, so a late read cannot unblock you
 --====================================================================
 local KEY_G, KEY_F = 0x47, 0x46
-local BUF_GAP     = 0.03   -- release -> press, so Roblox registers both
-local BUF_CONFIRM = 0.05   -- marker must be gone this long before it counts as lost
-local BUF_FIRST   = 0.15   -- after your own press: time (+ping) before the one buffered retry
-local BUF_RETRY   = 0.2    -- between re-presses (+ping): time for the game to confirm
-local BUF_MAX     = 3      -- re-presses per trigger
+local HOLD_GAP           = 0.03   -- release -> press, so Roblox registers both
+local HOLD_GRACE         = 0.12   -- after any press (+ping): let the game confirm first
+local HOLD_RETRY         = 0.15   -- between re-presses while nothing confirms (+ping)
+local HOLD_ABSENT_FRAMES = 3      -- consecutive reads without the marker
+local HOLD_ABSENT_TIME   = 0.08   -- ...for at least this long
+
+local DISABLE_MARKERS = { "Stun", "Ragdoll", "Ragdolled", "Knocked", "Unconscious" }
+local MANA_EXTRA_WAIT = { "ManaStop", "ActiveCast", "SpellBlocking", "Climbing" }
 
 local function pingDelay()
     local ok, ms = pcall(GetPingValue)
-    if ok and type(ms) == "number" and ms > 0 and ms < 2000 then return ms / 900 end
+    if ok and type(ms) == "number" and ms > 0 and ms < 2000 then return ms / 700 end
     return 0
 end
 
-local function newBuffer(key, setting)
+local function newHold(key, setting)
     return {
         key = key, setting = setting, status = "off",
-        heldSince = nil, phase = nil, phaseAt = 0,
-        wasMarker = false, wasBlocked = false, everMarker = false, triedFirst = false,
-        lostSince = nil, armed = false, attempts = 0, nextAllowed = 0,
+        heldSince = nil, phase = nil, phaseAt = 0, nextAllowed = 0,
+        absentFrames = 0, absentSince = nil, wasDisabled = false,
     }
 end
 
-local function resetBuffer(b)
-    b.heldSince = nil
-    b.armed = false
-    b.attempts = 0
-    b.lostSince = nil
-    b.wasMarker = false
-    b.wasBlocked = false
-    b.everMarker = false
-    b.triedFirst = false
+local function resetHold(h)
+    h.heldSince = nil
+    h.absentFrames = 0
+    h.absentSince = nil
+    h.wasDisabled = false
 end
 
--- probe(model) -> done (nothing to do), blocked (cannot act yet), label
-local function stepBuffer(b, active, probe)
+local function repress(h, now, why)
+    h.status = why
+    h.absentFrames = 0
+    h.absentSince = nil
+    h.nextAllowed = now + HOLD_GAP + HOLD_RETRY + pingDelay()
+    pcall(keyrelease, h.key)
+    h.phase = "released"
+    h.phaseAt = now + HOLD_GAP
+end
+
+-- probe(model) -> active (nothing to do), disabledBy (marker name or nil)
+local function stepHold(h, active, probe)
     local now = tick()
 
-    -- second half of a re-press; runs before the "is the key held" check, because our own
+    -- second half of a re-press; before the "is the key held" check, because our own
     -- release may briefly read as the key not held
-    if b.phase == "released" then
-        if now >= b.phaseAt then
-            pcall(keypress, b.key)
-            b.phase = nil
+    if h.phase == "released" then
+        if now >= h.phaseAt then
+            pcall(keypress, h.key)
+            h.phase = nil
+            local grace = now + HOLD_GRACE + pingDelay()
+            if grace > h.nextAllowed then h.nextAllowed = grace end
         end
         return
     end
 
-    if not ui(b.setting) then
-        b.status = "off"
-        resetBuffer(b)
+    if not ui(h.setting) then
+        h.status = "off"
+        resetHold(h)
         return
     end
-    if not (active and iskeypressed(b.key)) then
-        b.status = "ready"
-        resetBuffer(b)
+    if not (active and iskeypressed(h.key)) then
+        h.status = "ready"
+        resetHold(h)
         return
     end
 
     local m = myModel()
     if not m then
-        b.status = "no character"
-        return
-    end
-    local done, blocked, label = probe(m)
-
-    if not b.heldSince then                          -- first frame of this hold
-        b.heldSince = now
-        b.wasMarker = done
-        b.everMarker = done
-        b.wasBlocked = blocked
-        b.status = label
+        h.status = "no character"
         return
     end
 
-    if done then
-        b.status = label
-        b.armed = false
-        b.attempts = 0
-        b.lostSince = nil
-        b.wasMarker = true
-        b.everMarker = true
-        b.wasBlocked = false
+    if not h.heldSince then                     -- your own press: give the game time to react
+        h.heldSince = now
+        h.nextAllowed = now + HOLD_GRACE + pingDelay()
+    end
+
+    local isActive, disabledBy = probe(m)
+    if isActive then
+        h.status = (h.key == KEY_F) and "blocking" or "charging"
+        h.absentFrames = 0
+        h.absentSince = nil
+        h.wasDisabled = false
         return
     end
-    if blocked then
-        b.status = label
-        b.wasBlocked = true
-        b.wasMarker = false
-        b.lostSince = nil
+    if disabledBy then
+        h.status = "waiting (" .. disabledBy .. ")"
+        h.wasDisabled = true
+        h.absentFrames = 0
+        h.absentSince = nil
         return
     end
 
-    -- free to act, but nothing running: was there an interruption?
-    if b.wasBlocked then
-        b.armed = true                               -- 1. stun just ended: act now
-        b.attempts = 0
-        b.nextAllowed = 0
-    elseif b.wasMarker then
-        if not b.lostSince then b.lostSince = now end
-        if now - b.lostSince >= BUF_CONFIRM then     -- 2. really lost, not a bad read
-            b.armed = true
-            b.attempts = 0
-            b.lostSince = nil
-            b.wasMarker = false
-        end
-    elseif not b.everMarker and not b.triedFirst and now - b.heldSince >= BUF_FIRST + pingDelay() then
-        b.armed = true                               -- 3. pressed too early: one buffered retry
-        b.attempts = 0
-        b.triedFirst = true
-    end
-    b.wasBlocked = false
-
-    if not b.armed then
-        if b.status ~= "gave up - waiting for next stun" then b.status = "waiting" end
+    -- free, but not active
+    if h.wasDisabled then                       -- the stun / ragdoll just ended: go now
+        h.wasDisabled = false
+        repress(h, now, "re-pressing (stun ended)")
         return
     end
-    if b.attempts >= BUF_MAX then
-        b.armed = false
-        b.status = "gave up - waiting for next stun"
+    h.absentFrames = h.absentFrames + 1
+    if not h.absentSince then h.absentSince = now end
+    if h.absentFrames < HOLD_ABSENT_FRAMES or now - h.absentSince < HOLD_ABSENT_TIME then return end
+    if now < h.nextAllowed then
+        h.status = "waiting for the game"
         return
     end
-    if now < b.nextAllowed then return end
-
-    b.attempts = b.attempts + 1
-    b.nextAllowed = now + BUF_GAP + BUF_RETRY + pingDelay()
-    b.status = "re-pressing (" .. b.attempts .. "/" .. BUF_MAX .. ")"
-    pcall(keyrelease, b.key)
-    b.phase = "released"
-    b.phaseAt = now + BUF_GAP
+    repress(h, now, "re-pressing")
 end
 
-local MANA_BLOCKERS = { "Stun", "ManaStop", "ActiveCast", "SpellBlocking", "Climbing" }
-
-local function manaProbe(m)
-    if m:FindFirstChild("Charge") then return true, false, "charging" end
-    local mv = m:FindFirstChild("Mana")
-    local v = mv and prop(mv, "Value")
-    if type(v) == "number" and v >= 98 then return true, false, "full" end
-    for _, n in ipairs(MANA_BLOCKERS) do
-        if m:FindFirstChild(n) then return false, true, "waiting (" .. n .. ")" end
+local function firstChildOf(m, names)
+    for _, n in ipairs(names) do
+        if m:FindFirstChild(n) then return n end
     end
-    return false, false, "waiting"
+    return nil
 end
 
 local function blockProbe(m)
-    if m:FindFirstChild("Blocking") then return true, false, "blocking" end
-    if m:FindFirstChild("Stun") then return false, true, "stunned - blocks when it ends" end
-    return false, false, "waiting"
+    if m:FindFirstChild("Blocking") then return true, nil end
+    return false, firstChildOf(m, DISABLE_MARKERS)
 end
 
-local manaBuf  = newBuffer(KEY_G, "mana_on")
-local blockBuf = newBuffer(KEY_F, "block_on")
+local function manaProbe(m)
+    if m:FindFirstChild("Charge") then return true, nil end
+    local mv = m:FindFirstChild("Mana")
+    local v = mv and prop(mv, "Value")
+    if type(v) == "number" and v >= 98 then return true, nil end
+    return false, firstChildOf(m, DISABLE_MARKERS) or firstChildOf(m, MANA_EXTRA_WAIT)
+end
 
--- optional executor-style Block remote (Pro / Hybrid only)
-local blockRemote = { remote = nil, char = nil, checkAt = 0, last = 0 }
+local manaHold  = newHold(KEY_G, "mana_on")
+local blockHold = newHold(KEY_F, "block_on")
+
+-- Remote (Matcha Pro) block method: executor-style, fires Block(false) every frame while F is
+-- held and never releases the key, so it can never unblock you.
+local blockRemote = { remote = nil, char = nil, checkAt = 0, last = 0, freeSince = nil }
 local blockConns = {}
 
 local function getBlockRemote(now)
@@ -1278,16 +1262,55 @@ local function getBlockRemote(now)
     return r.remote
 end
 
-local function sendBlockRemote(active)
-    if not ui("block_on") or not ui("block_remote") then return end
-    if not (active and iskeypressed(KEY_F)) then return end
+local function blockRemoteStep(active)
+    local r = blockRemote
     local now = tick()
-    local delay = (tonumber(ui("block_delay")) or 0) / 1000
-    if delay > 0 and now - blockRemote.last < delay then return end
+    if not ui("block_on") then
+        blockHold.status = "off"
+        return
+    end
+    if not (active and iskeypressed(KEY_F)) then
+        blockHold.status = "ready (remote)"
+        r.freeSince = nil
+        getBlockRemote(now)
+        return
+    end
+    local m = myModel()
     local remote = getBlockRemote(now)
-    if not remote then return end
-    if not pcall(function() remote:FireServer(false) end) then blockRemote.remote = nil end
-    blockRemote.last = now
+    if not m or not remote then
+        blockHold.status = "Block remote not found"
+        return
+    end
+    local delay = (tonumber(ui("block_delay")) or 0) / 1000
+    if delay <= 0 or now - r.last >= delay then
+        if not pcall(function() remote:FireServer(false) end) then
+            r.remote = nil
+            blockHold.status = "FireServer error - needs Matcha Pro"
+            return
+        end
+        r.last = now
+    end
+    -- report whether the remote actually does anything on this Matcha
+    if m:FindFirstChild("Blocking") then
+        blockHold.status = "blocking (remote)"
+        r.freeSince = nil
+    elseif firstChildOf(m, DISABLE_MARKERS) then
+        blockHold.status = "waiting (remote)"
+        r.freeSince = nil
+    else
+        r.freeSince = r.freeSince or now
+        if now - r.freeSince > 0.6 then
+            blockHold.status = "remote sent but no block - Matcha Pro / Hybrid needed"
+        end
+    end
+end
+
+local function blockStep(active)
+    if (tonumber(ui("block_method")) or 0) == 1 then
+        blockRemoteStep(active)
+    else
+        stepHold(blockHold, active, blockProbe)
+    end
 end
 
 --====================================================================
@@ -1300,9 +1323,8 @@ local function onFrame()
     local active = isrbxactive()
 
     -- combat first: timing matters most here
-    pcall(stepBuffer, blockBuf, active, blockProbe)
-    pcall(stepBuffer, manaBuf, active, manaProbe)
-    pcall(sendBlockRemote, active)
+    pcall(blockStep, active)
+    pcall(stepHold, manaHold, active, manaProbe)
 
     pcall(spectateFrame, active)
 
@@ -1315,8 +1337,8 @@ local function onFrame()
 
     if now >= statusNext then
         statusNext = now + 0.5
-        setField("rl_block_status", blockBuf.status)
-        setField("rl_mana_status", manaBuf.status)
+        setField("rl_block_status", blockHold.status)
+        setField("rl_mana_status", manaHold.status)
     end
 end
 
