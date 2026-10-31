@@ -5,7 +5,7 @@
 --   * Better mana charge: hold G and charging restarts by itself whenever it gets interrupted
 --   * Hold block (F) [PRO NEEDED]: executor method, sends Block every frame while F is held
 --   * Better mana charge (G): executor method [PRO NEEDED] when the mana remote is found
---   * Anti backfire Viribus (no Pro needed)
+--   * Anti backfire Viribus (no Pro needed): spams F when a left-click Viribus will backfire
 -- Settings live in Matcha's menu, tab "Alan Hub".
 --
 -- Spectate:  right-click a leaderboard name to spectate, again to stop, another name to switch.
@@ -136,7 +136,7 @@ local function renderTab(tab)
     cb:SliderInt("rl_block_delay", "Block delay (ms)", 0, 1000, DEFAULTS.block_delay)
     cb:InputText("rl_block_status", "Block status", "off")
     cb:Toggle("rl_viri_on", "Anti backfire Viribus", DEFAULTS.viri_on)
-    cb:Tip("Snapping Viribus (right-click) outside 60-70 mana: blocks so you don't eat the backfire")
+    cb:Tip("Left-click Viribus at a backfire mana (not 25-35 / 60-75): spams F to block the pillar")
     cb:InputText("rl_viri_status", "Viribus status", "off")
 
     local lt = tab:Section("Last looted", "Left")
@@ -1432,36 +1432,48 @@ end
 
 --====================================================================
 -- ANTI BACKFIRE VIRIBUS  (no Pro needed)
--- Executor: Viribus has two mana windows - normal cast 23-35, right-click SNAP 60-70.
--- Snapping outside 60-70 backfires. When you right-click (RightClick remote) with Viribus
--- equipped, not on snap cooldown (SnapCool tag), no Philosopher's Stone, and
--- 0 < mana < 60 or mana > 70, it does:
---     wait 0.01s -> block -> wait until the character has "Action" -> unblock
--- The executor blocks with the Block/Unblock remotes, and itself falls back to pressing F
--- when those are missing. This uses that F fallback (Matcha keypress / keyrelease), so it
--- needs no Pro. Differences: the right-click is detected directly (Matcha cannot hook
--- RightClick), SnapCool is a CollectionService tag Matcha cannot read (not checked), the wait
--- for "Action" stops after 2s, and nothing happens if you are already holding F yourself.
+-- Viribus (wiki): normal cast at 25-35% mana, snap at 60-75%. Casting outside both windows
+-- backfires and a single pillar strikes you - which can be blocked.
+-- When you LEFT-CLICK with Viribus equipped, mana > 0 and outside 25-35 and 60-75, and no
+-- Philosopher's Stone, the hub spams F (press / release) until the cast is over: the game's
+-- "Action" marker appeared and cleared again, or VIRI_MAX seconds passed. F is always left
+-- released at the end, and nothing happens if you are already holding F yourself.
 --====================================================================
+local VIRI_PRESS = 0.05      -- F down time per spam
+local VIRI_GAP   = 0.03      -- F up time between spams
+local VIRI_MAX   = 1.5       -- spam at most this long
+
 local viri = { wasDown = false, busy = false, status = "off" }
 
-local function viribusBlock()
+local function viriBackfires(v)
+    if type(v) ~= "number" or v <= 0 then return false end
+    if v >= 25 and v <= 35 then return false end     -- normal cast
+    if v >= 60 and v <= 75 then return false end     -- snap
+    return true
+end
+
+local function viribusSpam()
     viri.busy = true
-    task.wait(0.01)
-    pcall(keypress, KEY_F)                      -- block
-    local deadline = tick() + 2
-    repeat
-        task.wait()
+    viri.status = "backfire - spamming F"
+    local started = tick()
+    local sawAction = false
+    while tick() - started < VIRI_MAX do
+        pcall(keypress, KEY_F)
+        task.wait(VIRI_PRESS)
+        pcall(keyrelease, KEY_F)
         local m = myModel()
-        if m and m:FindFirstChild("Action") then break end
-    until tick() > deadline
-    pcall(keyrelease, KEY_F)                    -- unblock
-    viri.status = "blocked a backfire snap"
+        local hasAction = m ~= nil and m:FindFirstChild("Action") ~= nil
+        if hasAction then sawAction = true end
+        if sawAction and not hasAction then break end   -- the cast is over
+        task.wait(VIRI_GAP)
+    end
+    pcall(keyrelease, KEY_F)                            -- never leave F stuck down
+    viri.status = "blocked a backfire"
     viri.busy = false
 end
 
 local function viribusFrame(active)
-    local down = ismouse2pressed()
+    local down = ismouse1pressed()
     local pressed = down and not viri.wasDown
     viri.wasDown = down
     if not ui("viri_on") then
@@ -1471,7 +1483,7 @@ local function viribusFrame(active)
     if viri.busy then return end
     local m = myModel()
     if not m or not m:FindFirstChild("Viribus") then
-        if viri.status ~= "blocked a backfire snap" then viri.status = "ready - equip Viribus" end
+        if viri.status ~= "blocked a backfire" then viri.status = "ready - equip Viribus" end
         return
     end
     if not pressed or not active then return end
@@ -1483,16 +1495,15 @@ local function viribusFrame(active)
     end
     local mv = m:FindFirstChild("Mana")
     local v = mv and prop(mv, "Value")
-    if type(v) ~= "number" then return end
-    if (v > 0 and v < 60) or v > 70 then
-        if iskeypressed(KEY_F) then
-            viri.status = "you are already holding F"
-            return
-        end
-        task.spawn(viribusBlock)
-    else
-        viri.status = "mana " .. math.floor(v) .. " is in 60-70 - safe snap"
+    if not viriBackfires(v) then
+        viri.status = "mana " .. (type(v) == "number" and math.floor(v) or "?") .. " - no backfire"
+        return
     end
+    if iskeypressed(KEY_F) then
+        viri.status = "you are already holding F"
+        return
+    end
+    task.spawn(viribusSpam)
 end
 
 --====================================================================
