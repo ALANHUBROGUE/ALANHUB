@@ -3,7 +3,7 @@
 --   * Trinket ESP
 --   * Last looted timers (Castle Rock, Temple of Fire, Deep Sunken, Crypt of Kings)
 --   * Better mana charge: hold G and charging restarts by itself whenever it gets interrupted
---   * Hold block (F): hold F through stun and the block goes up the moment it can
+--   * Hold block (F) [PRO NEEDED]: executor method, sends Block every frame while F is held
 -- Settings live in Matcha's menu, tab "Alan Hub".
 --
 -- Spectate:  right-click a leaderboard name to spectate, again to stop, another name to switch.
@@ -44,7 +44,7 @@ local DEFAULTS = {
     types_common  = false, types_rare = false, types_mythic = true, types_artifact = true, types_event = false,
     mana_on       = false,
     block_on      = false,
-    block_method  = 0,      -- 0 = Keys, 1 = Remote (Matcha Pro)
+    block_mode    = 0,      -- 0 = Remote (PRO NEEDED, executor method), 1 = Keys (no Pro)
     block_delay   = 0,
     far_common    = false, far_rare  = false, far_mythic  = true, far_artifact  = true, far_event  = false,
 }
@@ -128,10 +128,10 @@ local function renderTab(tab)
     cb:Toggle("rl_mana_on", "Better mana charge (hold G)", DEFAULTS.mana_on)
     cb:Tip("Hold G: charging (re)starts as soon as it is possible")
     cb:InputText("rl_mana_status", "Mana status", "off")
-    cb:Toggle("rl_block_on", "Hold block (F)", DEFAULTS.block_on)
+    cb:Toggle("rl_block_on", "Hold block (F)  [PRO NEEDED]", DEFAULTS.block_on)
     cb:Tip("Hold F through stun / ragdoll / combos: blocks as soon as it is possible")
-    cb:Combo("rl_block_method", "Block method", { "Keys", "Remote (Matcha Pro)" }, DEFAULTS.block_method)
-    cb:Tip("Remote = executor-style, never unblocks you, but needs Matcha Pro / Hybrid")
+    cb:Combo("rl_block_mode", "Block method", { "Remote  [PRO NEEDED]", "Keys  (no Pro, less reliable)" }, DEFAULTS.block_mode)
+    cb:Tip("Remote = executor method: sends Block every frame, never unblocks you. Needs Matcha Pro + Hybrid")
     cb:SliderInt("rl_block_delay", "Remote delay (ms)", 0, 1000, DEFAULTS.block_delay)
     cb:InputText("rl_block_status", "Block status", "off")
 
@@ -1285,7 +1285,7 @@ local function blockRemoteStep(active)
     if delay <= 0 or now - r.last >= delay then
         if not pcall(function() remote:FireServer(false) end) then
             r.remote = nil
-            blockHold.status = "FireServer error - needs Matcha Pro"
+            blockHold.status = "FireServer error - PRO NEEDED (enable Hybrid)"
             return
         end
         r.last = now
@@ -1300,16 +1300,16 @@ local function blockRemoteStep(active)
     else
         r.freeSince = r.freeSince or now
         if now - r.freeSince > 0.6 then
-            blockHold.status = "remote sent but no block - Matcha Pro / Hybrid needed"
+            blockHold.status = "sent but no block - PRO NEEDED / Hybrid off?"
         end
     end
 end
 
 local function blockStep(active)
-    if (tonumber(ui("block_method")) or 0) == 1 then
-        blockRemoteStep(active)
+    if (tonumber(ui("block_mode")) or 0) == 1 then
+        stepHold(blockHold, active, blockProbe)      -- Keys (no Pro)
     else
-        stepHold(blockHold, active, blockProbe)
+        blockRemoteStep(active)                      -- Remote [PRO NEEDED]
     end
 end
 
