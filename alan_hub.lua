@@ -5,6 +5,7 @@
 --   * Better mana charge: hold G and charging restarts by itself whenever it gets interrupted
 --   * Hold block (F) [PRO NEEDED]: executor method, sends Block every frame while F is held
 --   * Better mana charge (G): executor method [PRO NEEDED] when the mana remote is found
+--   * Anti backfire Viribus [PRO + HYBRID NEEDED]
 -- Settings live in Matcha's menu, tab "Alan Hub".
 --
 -- Spectate:  right-click a leaderboard name to spectate, again to stop, another name to switch.
@@ -46,6 +47,7 @@ local DEFAULTS = {
     mana_on       = false,
     block_on      = false,
     block_delay   = 0,
+    viri_on       = false,
     far_common    = false, far_rare  = false, far_mythic  = true, far_artifact  = true, far_event  = false,
 }
 
@@ -133,6 +135,9 @@ local function renderTab(tab)
     cb:Tip("Needs Matcha Pro with Hybrid mode on. Hold F through stun / ragdoll / combos")
     cb:SliderInt("rl_block_delay", "Block delay (ms)", 0, 1000, DEFAULTS.block_delay)
     cb:InputText("rl_block_status", "Block status", "off")
+    cb:Toggle("rl_viri_on", "Anti backfire Viribus  [PRO + HYBRID NEEDED]", DEFAULTS.viri_on)
+    cb:Tip("Casting Viribus outside 60-70 mana: blocks through the cast so the backfire is blocked")
+    cb:InputText("rl_viri_status", "Viribus status", "off")
 
     local lt = tab:Section("Last looted", "Left")
     for i, a in ipairs(LOOT_AREAS) do
@@ -1426,6 +1431,81 @@ local function manaStep(active)
 end
 
 --====================================================================
+-- ANTI BACKFIRE VIRIBUS  [PRO + HYBRID NEEDED]  - replica of the executor feature
+-- Executor: when you right-click to cast (RightClick remote) with Viribus equipped, no
+-- Philosopher's Stone, not on snap cooldown, and mana outside the 60-70 window
+-- (0 < mana < 60 or mana > 70):
+--     wait 0.01s -> Block:FireServer(false) -> wait until the character has "Action"
+--     -> Unblock:FireServer({})
+-- Matcha cannot hook RightClick, so the right-click itself (mouse button 2) is detected.
+-- The snap-cooldown check is skipped: it is a CollectionService tag, which Matcha cannot read.
+-- The wait for "Action" stops after 2s (the executor waits forever), so you never stay blocked.
+--====================================================================
+local viri = { wasDown = false, busy = false, status = "off" }
+
+local function charRemote(name)
+    local char = myModel()
+    local handler = char and char:FindFirstChild("CharacterHandler")
+    local remotes = handler and handler:FindFirstChild("Remotes")
+    return remotes and remotes:FindFirstChild(name) or nil
+end
+
+local function viribusBlock()
+    local blockR, unblockR = charRemote("Block"), charRemote("Unblock")
+    if not blockR or not unblockR then
+        viri.status = "Block / Unblock remote not found"
+        return
+    end
+    viri.busy = true
+    task.wait(0.01)
+    if not pcall(function() blockR:FireServer(false) end) then
+        viri.status = "FireServer error - PRO + HYBRID NEEDED"
+        viri.busy = false
+        return
+    end
+    local deadline = tick() + 2
+    repeat
+        task.wait()
+        local m = myModel()
+        if m and m:FindFirstChild("Action") then break end
+    until tick() > deadline
+    pcall(function() unblockR:FireServer({}) end)
+    viri.status = "blocked a backfire cast"
+    viri.busy = false
+end
+
+local function viribusFrame(active)
+    local down = ismouse2pressed()
+    local pressed = down and not viri.wasDown
+    viri.wasDown = down
+    if not ui("viri_on") then
+        viri.status = "off"
+        return
+    end
+    if viri.busy then return end
+    local m = myModel()
+    if not m or not m:FindFirstChild("Viribus") then
+        if viri.status ~= "blocked a backfire cast" then viri.status = "ready - equip Viribus" end
+        return
+    end
+    if not pressed or not active then return end
+
+    local arts = m:FindFirstChild("Artifacts")
+    if arts and arts:FindFirstChild("PhilosophersStone") then
+        viri.status = "Philosopher's Stone - no backfire"
+        return
+    end
+    local mv = m:FindFirstChild("Mana")
+    local v = mv and prop(mv, "Value")
+    if type(v) ~= "number" then return end
+    if (v > 0 and v < 60) or v > 70 then
+        task.spawn(viribusBlock)
+    else
+        viri.status = "mana " .. math.floor(v) .. " is in 60-70 - safe cast"
+    end
+end
+
+--====================================================================
 -- MAIN LOOP
 --====================================================================
 local espNext, statusNext = 0, 0
@@ -1436,6 +1516,7 @@ local function onFrame()
 
     -- combat first: timing matters most here
     pcall(blockStep, active)
+    pcall(viribusFrame, active)
     pcall(manaStep, active)
 
     pcall(spectateFrame, active)
@@ -1451,6 +1532,7 @@ local function onFrame()
         statusNext = now + 0.5
         setField("rl_block_status", blockState.status)
         setField("rl_mana_status", mana.status)
+        setField("rl_viri_status", viri.status)
     end
 end
 
