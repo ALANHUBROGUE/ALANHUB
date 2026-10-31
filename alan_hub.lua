@@ -126,7 +126,7 @@ local function renderTab(tab)
 
     local cb = tab:Section("Combat", "Left")
     cb:Toggle("rl_mana_on", "Better mana charge (hold G)", DEFAULTS.mana_on)
-    cb:Tip("Hold G: charging (re)starts as soon as it is possible")
+    cb:Tip("Hold G: charging restarts by itself when it gets interrupted")
     cb:InputText("rl_mana_status", "Mana status", "off")
     cb:Toggle("rl_block_on", "Hold block (F)  [PRO NEEDED]", DEFAULTS.block_on)
     cb:Tip("Hold F through stun / ragdoll / combos: blocks as soon as it is possible")
@@ -1118,7 +1118,6 @@ local HOLD_ABSENT_FRAMES = 3      -- consecutive reads without the marker
 local HOLD_ABSENT_TIME   = 0.08   -- ...for at least this long
 
 local DISABLE_MARKERS = { "Stun", "Ragdoll", "Ragdolled", "Knocked", "Unconscious" }
-local MANA_EXTRA_WAIT = { "ManaStop", "ActiveCast", "SpellBlocking", "Climbing" }
 
 local function pingDelay()
     local ok, ms = pcall(GetPingValue)
@@ -1233,15 +1232,6 @@ local function blockProbe(m)
     return false, firstChildOf(m, DISABLE_MARKERS)
 end
 
-local function manaProbe(m)
-    if m:FindFirstChild("Charge") then return true, nil end
-    local mv = m:FindFirstChild("Mana")
-    local v = mv and prop(mv, "Value")
-    if type(v) == "number" and v >= 98 then return true, nil end
-    return false, firstChildOf(m, DISABLE_MARKERS) or firstChildOf(m, MANA_EXTRA_WAIT)
-end
-
-local manaHold  = newHold(KEY_G, "mana_on")
 local blockHold = newHold(KEY_F, "block_on")
 
 -- Remote (Matcha Pro) block method: executor-style, fires Block(false) every frame while F is
@@ -1314,6 +1304,98 @@ local function blockStep(active)
 end
 
 --====================================================================
+-- BETTER MANA CHARGE (G) - the first version, kept as close to the executor as keys allow.
+-- Executor: on G it charges; then every frame while G is held, if "Charge" is missing it
+-- charges again and waits 0.1s + ping/900. Here a "charge again" is a G re-press:
+--   * first check 0.15s + ping after you press G (the game needs a moment to add "Charge")
+--   * 30ms between release and re-press, so Roblox registers both
+--   * 0.1s + ping/900 after each re-press before checking again (same as the executor)
+--   * no up-and-down: "Charge" must be missing for MANA_CONFIRM across more than one check,
+--     and nothing is re-pressed at 98+ mana (a re-press starts with a release = drain)
+--====================================================================
+local mana = { heldSince = nil, nextTry = 0, phase = nil, phaseAt = 0, missingSince = nil, status = "off" }
+local MANA_FIRST   = 0.15   -- seconds after your own press before the first check
+local MANA_GAP     = 0.03   -- seconds between release and re-press
+local MANA_CONFIRM = 0.05   -- "Charge" must be missing this long before re-pressing
+
+local function manaPing()
+    local ok, ms = pcall(GetPingValue)
+    if ok and type(ms) == "number" and ms > 0 and ms < 2000 then return ms / 900 end
+    return 0
+end
+
+-- charging, or nothing to charge (98+ mana)
+local function manaSatisfied()
+    local m = myModel()
+    if not m then return true end
+    if m:FindFirstChild("Charge") then
+        mana.status = "charging"
+        return true
+    end
+    local mv = m:FindFirstChild("Mana")
+    local v = mv and prop(mv, "Value")
+    if type(v) == "number" and v >= 98 then
+        mana.status = "full"
+        return true
+    end
+    return false
+end
+
+local function manaFrame(active)
+    local now = tick()
+
+    -- step 2 of a re-press: key down again a moment after our release. Runs before the
+    -- "is G held" check, because our own release may briefly read as G not held.
+    if mana.phase == "released" then
+        if now >= mana.phaseAt then
+            pcall(keypress, KEY_G)
+            mana.phase = nil
+            mana.nextTry = now + 0.1 + manaPing()   -- executor: wait 0.1s + ping/900
+        end
+        return
+    end
+
+    local held = iskeypressed(KEY_G)
+    if not ui("mana_on") then
+        mana.status = "off"
+        mana.heldSince = nil
+        mana.missingSince = nil
+        return
+    end
+    if not active or not held then
+        mana.status = "ready"
+        mana.heldSince = nil
+        mana.missingSince = nil
+        return
+    end
+    if not mana.heldSince then
+        mana.heldSince = now
+        mana.nextTry = now + MANA_FIRST + manaPing()
+        mana.missingSince = nil
+        return
+    end
+
+    if now < mana.nextTry then return end
+    if manaSatisfied() then
+        mana.missingSince = nil
+        return
+    end
+    -- debounce: only act when "Charge" has been gone for a moment (and more than one check)
+    if not mana.missingSince then
+        mana.missingSince = now
+        return
+    end
+    if now - mana.missingSince < MANA_CONFIRM then return end
+
+    -- step 1: release G so the game sees a fresh press
+    mana.missingSince = nil
+    mana.status = "re-pressing G"
+    pcall(keyrelease, KEY_G)
+    mana.phase = "released"
+    mana.phaseAt = now + MANA_GAP
+end
+
+--====================================================================
 -- MAIN LOOP
 --====================================================================
 local espNext, statusNext = 0, 0
@@ -1324,7 +1406,7 @@ local function onFrame()
 
     -- combat first: timing matters most here
     pcall(blockStep, active)
-    pcall(stepHold, manaHold, active, manaProbe)
+    pcall(manaFrame, active)
 
     pcall(spectateFrame, active)
 
@@ -1338,7 +1420,7 @@ local function onFrame()
     if now >= statusNext then
         statusNext = now + 0.5
         setField("rl_block_status", blockHold.status)
-        setField("rl_mana_status", manaHold.status)
+        setField("rl_mana_status", mana.status)
     end
 end
 
