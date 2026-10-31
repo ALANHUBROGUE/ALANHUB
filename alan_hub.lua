@@ -1434,14 +1434,21 @@ end
 -- ANTI BACKFIRE VIRIBUS  (no Pro needed)
 -- Viribus (wiki): normal cast at 25-35% mana, snap at 60-75%. Casting outside both windows
 -- backfires and a single pillar strikes you - which can be blocked.
--- When you LEFT-CLICK with Viribus equipped, mana > 0 and outside 25-35 and 60-75, and no
--- Philosopher's Stone, the hub spams F (press / release) until the cast is over: the game's
--- "Action" marker appeared and cleared again, or VIRI_MAX seconds passed. F is always left
--- released at the end, and nothing happens if you are already holding F yourself.
+-- 1. LEFT-CLICK with Viribus equipped, mana > 0 outside 25-35 and 60-75, no Philosopher's
+--    Stone  -> armed (nothing pressed yet)
+-- 2. the cast must be CONFIRMED within VIRI_CONFIRM (+ping): the game adds "ActiveCast" to
+--    your character, or your mana drops by VIRI_DROP+. No confirmation (cooldown, cast did
+--    not start) -> nothing is pressed at all.
+-- 3. spam F (press / release) until the cast is over ("ActiveCast" gone), you get stunned,
+--    or VIRI_MAX seconds. F is always left released; nothing happens if you hold F yourself.
+-- (The executor detects casting with the "Casting" CollectionService tag, which Matcha cannot
+-- read - "ActiveCast" and the mana drop are the readable equivalents.)
 --====================================================================
-local VIRI_PRESS = 0.05      -- F down time per spam
-local VIRI_GAP   = 0.03      -- F up time between spams
-local VIRI_MAX   = 1.5       -- spam at most this long
+local VIRI_PRESS   = 0.05    -- F down time per spam
+local VIRI_GAP     = 0.03    -- F up time between spams
+local VIRI_MAX     = 1.5     -- spam at most this long
+local VIRI_CONFIRM = 0.35    -- seconds (+ping) for the cast to show up after the click
+local VIRI_DROP    = 5       -- mana drop that counts as "the spell was cast"
 
 local viri = { wasDown = false, busy = false, status = "off" }
 
@@ -1452,23 +1459,46 @@ local function viriBackfires(v)
     return true
 end
 
-local function viribusSpam()
+local function viribusWatch(manaAtClick)
     viri.busy = true
+    viri.status = "checking cast..."
+
+    -- 2. wait for proof that the spell is actually being cast
+    local t0 = tick()
+    local limit = VIRI_CONFIRM + manaPing()
+    local confirmed = false
+    while tick() - t0 < limit do
+        task.wait()
+        local m = myModel()
+        if not m then break end
+        if m:FindFirstChild("ActiveCast") then confirmed = true break end
+        local v = manaValue(m)
+        if v and manaAtClick - v >= VIRI_DROP then confirmed = true break end
+    end
+    if not confirmed then
+        viri.status = "no cast (cooldown?) - did nothing"
+        viri.busy = false
+        return
+    end
+
+    -- 3. spam F until the cast is over
     viri.status = "backfire - spamming F"
     local started = tick()
-    local sawAction = false
+    local sawCast = false
     while tick() - started < VIRI_MAX do
+        local m = myModel()
+        if not m then break end
+        if firstChildOf(m, DISABLE_MARKERS) then break end      -- stunned: stop, don't lock you up
+        local casting = m:FindFirstChild("ActiveCast") ~= nil
+        if casting then sawCast = true end
+        if sawCast and not casting then break end               -- cast over
         pcall(keypress, KEY_F)
         task.wait(VIRI_PRESS)
         pcall(keyrelease, KEY_F)
-        local m = myModel()
-        local hasAction = m ~= nil and m:FindFirstChild("Action") ~= nil
-        if hasAction then sawAction = true end
-        if sawAction and not hasAction then break end   -- the cast is over
         task.wait(VIRI_GAP)
     end
-    pcall(keyrelease, KEY_F)                            -- never leave F stuck down
-    viri.status = "blocked a backfire"
+    pcall(keyrelease, KEY_F)                                    -- never leave F stuck down
+    viri.status = "done (blocked backfire)"
     viri.busy = false
 end
 
@@ -1483,7 +1513,7 @@ local function viribusFrame(active)
     if viri.busy then return end
     local m = myModel()
     if not m or not m:FindFirstChild("Viribus") then
-        if viri.status ~= "blocked a backfire" then viri.status = "ready - equip Viribus" end
+        if viri.status == "off" then viri.status = "ready - equip Viribus" end
         return
     end
     if not pressed or not active then return end
@@ -1493,17 +1523,17 @@ local function viribusFrame(active)
         viri.status = "Philosopher's Stone - no backfire"
         return
     end
-    local mv = m:FindFirstChild("Mana")
-    local v = mv and prop(mv, "Value")
+    local v = manaValue(m)
     if not viriBackfires(v) then
-        viri.status = "mana " .. (type(v) == "number" and math.floor(v) or "?") .. " - no backfire"
+        viri.status = "mana " .. (v and math.floor(v) or "?") .. " - no backfire"
         return
     end
     if iskeypressed(KEY_F) then
         viri.status = "you are already holding F"
         return
     end
-    task.spawn(viribusSpam)
+    if firstChildOf(m, DISABLE_MARKERS) then return end     -- stunned: the click cannot cast
+    task.spawn(function() viribusWatch(v) end)
 end
 
 --====================================================================
