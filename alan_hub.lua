@@ -1258,7 +1258,14 @@ local KNOWN_MANA_REMOTES = {
 }
 local GUID_PATTERN = "^%x%x%x%x%x%x%x%x%-%x%x%x%x%-%x%x%x%x%-%x%x%x%x%-%x%x%x%x%x%x%x%x%x%x%x%x$"
 local manaR = { remote = nil, char = nil, checkAt = 0, cands = 0, failed = false,
-                wasHeld = false, charging = false, nextTry = 0 }
+                wasHeld = false, charging = false, nextTry = 0, sends = 0 }
+
+local function manaValue(m)
+    local mv = m and m:FindFirstChild("Mana")
+    local v = mv and prop(mv, "Value")
+    if type(v) == "number" then return v end
+    return nil
+end
 
 local function findManaRemote(now)
     local r = manaR
@@ -1308,6 +1315,7 @@ end
 local function manaFire(on)
     local remote = manaR.remote
     if not remote then return false end
+    manaR.sends = manaR.sends + 1
     local ok = pcall(function()
         if IS_GAIA then
             if on then remote:FireServer({ math.random(1, 10), math.random() }) else remote:FireServer() end
@@ -1332,7 +1340,8 @@ local function manaRemoteFrame(held)
     elseif held then
         if now >= r.nextTry then
             local m = myModel()
-            if m and not m:FindFirstChild("Charge") then
+            local v = manaValue(m)
+            if m and not m:FindFirstChild("Charge") and not (v and v >= 98) then
                 manaFire(true)
                 r.nextTry = now + 0.1 + manaPing()
             end
@@ -1356,13 +1365,14 @@ local function manaStep(active)
     local remote = (mana.phase == nil) and findManaRemote(now) or nil
     if remote then
         local held = active and iskeypressed(KEY_G)
+        if held and not manaR.wasHeld then manaR.sends = 0 end
         manaRemoteFrame(held)
-        if held then
-            local m = myModel()
-            mana.status = (m and m:FindFirstChild("Charge")) and "charging (remote)" or "starting charge (remote)"
-        else
-            mana.status = "ready (remote)"
-        end
+        local m = myModel()
+        local v = manaValue(m)
+        local info = " | mana " .. (v and math.floor(v) or "?")
+            .. " | Charge " .. ((m and m:FindFirstChild("Charge")) and "yes" or "no")
+            .. " | sent " .. manaR.sends
+        mana.status = (held and "holding G (remote)" or "ready (remote)") .. info
         return
     end
 
@@ -1370,6 +1380,12 @@ local function manaStep(active)
     if manaR.charging then manaFire(false); manaR.charging = false end
     manaR.wasHeld = false
     manaFrame(active)
+    if mana.status ~= "ready" and mana.status ~= "off" then
+        local m = myModel()
+        local v = manaValue(m)
+        mana.status = mana.status .. " (keys) | mana " .. (v and math.floor(v) or "?")
+            .. " | Charge " .. ((m and m:FindFirstChild("Charge")) and "yes" or "no")
+    end
     if mana.status == "ready" then
         if manaR.failed then
             mana.status = "ready (keys) - FireServer failed: PRO NEEDED + Hybrid"
