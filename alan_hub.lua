@@ -2,9 +2,6 @@
 --   * Leaderboard spectate (silent)
 --   * Trinket ESP
 --   * Last looted timers (Castle Rock, Temple of Fire, Deep Sunken, Crypt of Kings)
---   * Better mana charge: hold G and charging restarts by itself whenever it gets interrupted
---   * Hold block (F) [PRO NEEDED]: executor method, sends Block every frame while F is held
---   * Better mana charge (G): executor method [PRO NEEDED] when the mana remote is found
 --   * Anti backfire Viribus (no Pro needed): spams F when a left-click Viribus will backfire
 -- Settings live in Matcha's menu, tab "Alan Hub".
 --
@@ -44,9 +41,6 @@ local DEFAULTS = {
     esp_range     = 200,
     esp_max       = 60,
     types_common  = false, types_rare = false, types_mythic = true, types_artifact = true, types_event = false,
-    mana_on       = false,
-    block_on      = false,
-    block_delay   = 0,
     viri_on       = false,
     viri_time     = 900,    -- ms of F spam at most
     far_common    = false, far_rare  = false, far_mythic  = true, far_artifact  = true, far_event  = false,
@@ -129,13 +123,6 @@ local function renderTab(tab)
 
 
     local cb = tab:Section("Combat", "Left")
-    cb:Toggle("rl_mana_on", "Better mana charge (hold G)  [PRO + HYBRID NEEDED]", DEFAULTS.mana_on)
-    cb:Tip("Needs Matcha Pro with Hybrid mode on. Without them it falls back to re-pressing G (less reliable)")
-    cb:InputText("rl_mana_status", "Mana status", "off")
-    cb:Toggle("rl_block_on", "Hold block (F)  [PRO + HYBRID NEEDED]", DEFAULTS.block_on)
-    cb:Tip("Needs Matcha Pro with Hybrid mode on. Hold F through stun / ragdoll / combos")
-    cb:SliderInt("rl_block_delay", "Block delay (ms)", 0, 1000, DEFAULTS.block_delay)
-    cb:InputText("rl_block_status", "Block status", "off")
     cb:Toggle("rl_viri_on", "Anti backfire Viribus", DEFAULTS.viri_on)
     cb:Tip("Left-click Viribus at a backfire mana (not 25-35 / 60-75): spams F to block the pillar")
     cb:SliderInt("rl_viri_time", "Viribus spam time (ms)", 200, 1500, DEFAULTS.viri_time)
@@ -1072,9 +1059,9 @@ local function updateLootTimers()
 end
 
 --====================================================================
--- COMBAT: hold block (F) and better mana charge (G)
+-- COMBAT helpers (used by Anti backfire Viribus)
 --====================================================================
-local KEY_G, KEY_F = 0x47, 0x46
+local KEY_F = 0x46
 local DISABLE_MARKERS = { "Stun", "Ragdoll", "Ragdolled", "Knocked", "Unconscious" }
 
 local function firstChildOf(m, names)
@@ -1084,352 +1071,17 @@ local function firstChildOf(m, names)
     return nil
 end
 
---====================================================================
--- HOLD BLOCK (F)  [PRO NEEDED]  - the executor method
--- While F is held: CharacterHandler.Remotes.Block:FireServer(false) every frame (or every
--- "Block delay" ms). F is never released by the script, so it can never unblock you.
--- Needs Matcha Pro with Hybrid mode (that is where RemoteEvent:FireServer exists).
---====================================================================
-local blockState = { status = "off", remote = nil, char = nil, checkAt = 0, last = 0, freeSince = nil }
-local blockConns = {}
-
-local function getBlockRemote(now)
-    local r = blockState
-    local char = myModel()
-    if r.remote and char == r.char and now < r.checkAt then return r.remote end
-    r.checkAt = now + 0.5
-    if r.remote and char == r.char and prop(r.remote, "Parent") then return r.remote end
-    r.char = char
-    local handler = char and char:FindFirstChild("CharacterHandler")
-    local remotes = handler and handler:FindFirstChild("Remotes")
-    r.remote = remotes and remotes:FindFirstChild("Block") or nil
-    return r.remote
-end
-
-local function blockStep(active)
-    local r = blockState
-    local now = tick()
-    if not ui("block_on") then
-        r.status = "off"
-        return
-    end
-    if not (active and iskeypressed(KEY_F)) then
-        r.status = "ready - hold F"
-        r.freeSince = nil
-        getBlockRemote(now)                          -- keep it cached for an instant first send
-        return
-    end
-    local m = myModel()
-    local remote = getBlockRemote(now)
-    if not m or not remote then
-        r.status = "Block remote not found (spawned?)"
-        return
-    end
-    local delay = (tonumber(ui("block_delay")) or 0) / 1000
-    if delay <= 0 or now - r.last >= delay then
-        if not pcall(function() remote:FireServer(false) end) then
-            r.remote = nil
-            r.status = "FireServer error - PRO + HYBRID NEEDED"
-            return
-        end
-        r.last = now
-    end
-    if m:FindFirstChild("Blocking") then
-        r.status = "blocking"
-        r.freeSince = nil
-    elseif firstChildOf(m, DISABLE_MARKERS) then
-        r.status = "stunned - blocks when it ends"
-        r.freeSince = nil
-    else
-        r.freeSince = r.freeSince or now
-        if now - r.freeSince > 0.6 then
-            r.status = "sent but no block - PRO + HYBRID NEEDED"
-        end
-    end
-end
-
---====================================================================
--- BETTER MANA CHARGE (G) - the first version, kept as close to the executor as keys allow.
--- Executor: on G it charges; then every frame while G is held, if "Charge" is missing it
--- charges again and waits 0.1s + ping/900. Here a "charge again" is a G re-press:
---   * first check 0.15s + ping after you press G (the game needs a moment to add "Charge")
---   * 30ms between release and re-press, so Roblox registers both
---   * 0.1s + ping/900 after each re-press before checking again (same as the executor)
---   * no up-and-down: "Charge" must be missing for MANA_CONFIRM across more than one check,
---     and nothing is re-pressed at 98+ mana (a re-press starts with a release = drain)
---====================================================================
-local mana = { heldSince = nil, nextTry = 0, phase = nil, phaseAt = 0, missingSince = nil, status = "off" }
-local MANA_FIRST   = 0.15   -- seconds after your own press before the first check
-local MANA_GAP     = 0.03   -- seconds between release and re-press
-local MANA_CONFIRM = 0.05   -- "Charge" must be missing this long before re-pressing
-
 local function manaPing()
     local ok, ms = pcall(GetPingValue)
     if ok and type(ms) == "number" and ms > 0 and ms < 2000 then return ms / 900 end
     return 0
 end
 
--- charging, or nothing to charge (98+ mana)
-local function manaSatisfied()
-    local m = myModel()
-    if not m then return true end
-    if m:FindFirstChild("Charge") then
-        mana.status = "charging"
-        return true
-    end
-    local mv = m:FindFirstChild("Mana")
-    local v = mv and prop(mv, "Value")
-    if type(v) == "number" and v >= 98 then
-        mana.status = "full"
-        return true
-    end
-    return false
-end
-
-local function manaFrame(active)
-    local now = tick()
-
-    -- step 2 of a re-press: key down again a moment after our release. Runs before the
-    -- "is G held" check, because our own release may briefly read as G not held.
-    if mana.phase == "released" then
-        if now >= mana.phaseAt then
-            pcall(keypress, KEY_G)
-            mana.phase = nil
-            mana.nextTry = now + 0.1 + manaPing()   -- executor: wait 0.1s + ping/900
-        end
-        return
-    end
-
-    local held = iskeypressed(KEY_G)
-    if not ui("mana_on") then
-        mana.status = "off"
-        mana.heldSince = nil
-        mana.missingSince = nil
-        return
-    end
-    if not active or not held then
-        mana.status = "ready"
-        mana.heldSince = nil
-        mana.missingSince = nil
-        return
-    end
-    if not mana.heldSince then
-        mana.heldSince = now
-        mana.nextTry = now + MANA_FIRST + manaPing()
-        mana.missingSince = nil
-        return
-    end
-
-    if now < mana.nextTry then return end
-    if manaSatisfied() then
-        mana.missingSince = nil
-        return
-    end
-    -- debounce: only act when "Charge" has been gone for a moment (and more than one check)
-    if not mana.missingSince then
-        mana.missingSince = now
-        return
-    end
-    if now - mana.missingSince < MANA_CONFIRM then return end
-
-    -- step 1: release G so the game sees a fresh press
-    mana.missingSince = nil
-    mana.status = "re-pressing G"
-    pcall(keyrelease, KEY_G)
-    mana.phase = "released"
-    mana.phaseAt = now + MANA_GAP
-end
-
---====================================================================
--- BETTER MANA CHARGE (G) - executor method  [PRO NEEDED]
--- The executor finds the mana remote by spying on the game's own call (hookfunction, which
--- Matcha cannot do). Its code shows what the remote looks like per place, so it is searched
--- for in CharacterHandler.Remotes and ONLY used when exactly one remote matches:
---   14341521240 -> named "SetManaChargeState"
---   3541987450  -> named like a GUID
---   others      -> name starts with "M0ai"
--- Then, exactly like the executor:
---   G pressed  -> charge;  wait 0.1s + ping/900
---   G held     -> every frame: if no "Charge" -> charge;  wait 0.1s + ping/900
---   G released -> decharge
---   charge   = Gaia (5208655184): FireServer({math.random(1,10), math.random()}), else FireServer(true)
---   decharge = Gaia: FireServer(),                                         else FireServer(false)
--- If no single remote matches (or FireServer fails) the key re-press version below is used.
---====================================================================
-local IS_GAIA = (game.PlaceId == 5208655184)
-
--- Mana remotes confirmed with Matcha's Remote Spy (holding / releasing G). Used first; if a
--- game update renames it, the pattern search below takes over, then the key version.
-local KNOWN_MANA_REMOTES = {
-    [3541987450] = "5F4EAD79-23A0-4AAE-8F7A-1381A59D3577",
-}
-local GUID_PATTERN = "^%x%x%x%x%x%x%x%x%-%x%x%x%x%-%x%x%x%x%-%x%x%x%x%-%x%x%x%x%x%x%x%x%x%x%x%x$"
-local manaR = { remote = nil, char = nil, checkAt = 0, cands = 0, failed = false,
-                wasHeld = false, charging = false, nextTry = 0, sends = 0,
-                lastTrue = 0, lastFalse = 0, releasedAt = nil, cleanups = 0 }
-
 local function manaValue(m)
     local mv = m and m:FindFirstChild("Mana")
     local v = mv and prop(mv, "Value")
     if type(v) == "number" then return v end
     return nil
-end
-
-local function findManaRemote(now)
-    local r = manaR
-    local char = myModel()
-    if char == r.char and now < r.checkAt then return r.remote end
-    r.checkAt = now + 2
-    if r.remote and char == r.char and prop(r.remote, "Parent") then return r.remote end
-    r.char = char
-    r.remote = nil
-    r.cands = 0
-    r.failed = false
-    local handler = char and char:FindFirstChild("CharacterHandler")
-    local remotes = handler and handler:FindFirstChild("Remotes")
-    if not remotes then return nil end
-    local pid = game.PlaceId
-
-    local known = KNOWN_MANA_REMOTES[pid]
-    if known then
-        local k = remotes:FindFirstChild(known)
-        if k and prop(k, "ClassName") == "RemoteEvent" then
-            r.remote = k
-            r.cands = 1
-            return r.remote
-        end
-    end
-
-    local found = {}
-    for _, c in ipairs(remotes:GetChildren()) do
-        if prop(c, "ClassName") == "RemoteEvent" then
-            local n = tostring(prop(c, "Name") or "")
-            local match
-            if pid == 14341521240 then
-                match = (n == "SetManaChargeState")
-            elseif pid == 3541987450 then
-                match = (n:match(GUID_PATTERN) ~= nil)
-            else
-                match = (n:sub(1, 4) == "M0ai")
-            end
-            if match then found[#found + 1] = c end
-        end
-    end
-    r.cands = #found
-    if #found == 1 then r.remote = found[1] end   -- never guess between several
-    return r.remote
-end
-
-local function manaFire(on)
-    local remote = manaR.remote
-    if not remote then return false end
-    manaR.sends = manaR.sends + 1
-    local ok = pcall(function()
-        if IS_GAIA then
-            if on then remote:FireServer({ math.random(1, 10), math.random() }) else remote:FireServer() end
-        else
-            remote:FireServer(on and true or false)
-        end
-    end)
-    if ok then
-        if on then manaR.lastTrue = tick() else manaR.lastFalse = tick() end
-    else
-        manaR.failed = true
-        manaR.remote = nil
-        manaR.checkAt = tick() + 5
-    end
-    return ok
-end
-
--- true when the last mana signal the HUB sent was "charge" (so stopping it is our job)
-local function weLeftItCharging()
-    return manaR.lastTrue > manaR.lastFalse
-end
-
-local function manaRemoteFrame(held)
-    local now = tick()
-    local r = manaR
-    if held and not r.wasHeld then                    -- InputBegan G
-        manaFire(true)
-        r.charging = true
-        r.releasedAt = nil
-        r.cleanups = 0
-        r.nextTry = now + 0.1 + manaPing()
-    elseif held then
-        if now >= r.nextTry then
-            local m = myModel()
-            local v = manaValue(m)
-            if m and not m:FindFirstChild("Charge") and not (v and v >= 98) then
-                manaFire(true)
-                r.charging = true
-                r.nextTry = now + 0.1 + manaPing()
-            end
-        end
-    else
-        if r.wasHeld then                             -- G released
-            r.releasedAt = now
-            r.cleanups = 0
-            if r.charging or weLeftItCharging() then manaFire(false) end
-            r.charging = false
-        end
-        -- safety: still charging 0.3s / 0.6s / 0.9s after release, and the hub sent a
-        -- charge during that hold -> send stop again (never touches charges it did not cause)
-        if r.releasedAt and r.cleanups < 3 and now - r.releasedAt >= 0.3 * (r.cleanups + 1)
-            and r.lastTrue >= r.releasedAt - 1 then
-            local m = myModel()
-            if m and m:FindFirstChild("Charge") then
-                r.cleanups = r.cleanups + 1
-                manaFire(false)
-            elseif now - r.releasedAt > 1.5 then
-                r.releasedAt = nil
-            end
-        end
-    end
-    r.wasHeld = held
-end
-
-local function manaStep(active)
-    local now = tick()
-    if not ui("mana_on") then
-        if manaR.charging or weLeftItCharging() then manaFire(false); manaR.charging = false end
-        manaR.wasHeld = false
-        manaFrame(active)                               -- resets the key version, status "off"
-        return
-    end
-
-    local remote = (mana.phase == nil) and findManaRemote(now) or nil
-    if remote then
-        local held = active and iskeypressed(KEY_G)
-        if held and not manaR.wasHeld then manaR.sends = 0 end
-        manaRemoteFrame(held)
-        local m = myModel()
-        local v = manaValue(m)
-        local info = " | mana " .. (v and math.floor(v) or "?")
-            .. " | Charge " .. ((m and m:FindFirstChild("Charge")) and "yes" or "no")
-            .. " | sent " .. manaR.sends
-        mana.status = (held and "holding G (remote)" or "ready (remote)") .. info
-        return
-    end
-
-    -- fallback: key re-press
-    if manaR.charging or (manaR.remote and weLeftItCharging()) then manaFire(false); manaR.charging = false end
-    manaR.wasHeld = false
-    manaFrame(active)
-    if mana.status ~= "ready" and mana.status ~= "off" then
-        local m = myModel()
-        local v = manaValue(m)
-        mana.status = mana.status .. " (keys) | mana " .. (v and math.floor(v) or "?")
-            .. " | Charge " .. ((m and m:FindFirstChild("Charge")) and "yes" or "no")
-    end
-    if mana.status == "ready" then
-        if manaR.failed then
-            mana.status = "ready (keys) - FireServer failed: PRO + HYBRID NEEDED"
-        elseif manaR.cands == 0 then
-            mana.status = "ready (keys) - mana remote not found"
-        else
-            mana.status = "ready (keys) - " .. manaR.cands .. " possible mana remotes, not guessing"
-        end
-    end
 end
 
 --====================================================================
@@ -1549,9 +1201,7 @@ local function onFrame()
     local active = isrbxactive()
 
     -- combat first: timing matters most here
-    pcall(blockStep, active)
     pcall(viribusFrame, active)
-    pcall(manaStep, active)
 
     pcall(spectateFrame, active)
 
@@ -1564,8 +1214,6 @@ local function onFrame()
 
     if now >= statusNext then
         statusNext = now + 0.5
-        setField("rl_block_status", blockState.status)
-        setField("rl_mana_status", mana.status)
         setField("rl_viri_status", viri.status)
     end
 end
@@ -1604,7 +1252,6 @@ local function cleanup()
     espList = {}
     for _, n in ipairs(notifs) do pcall(removeNotif, n) end
     notifs = {}
-    for _, c in ipairs(blockConns) do pcall(function() c:Disconnect() end) end
     pcall(UI.RemoveTab, TAB_NAME)
 end
 
