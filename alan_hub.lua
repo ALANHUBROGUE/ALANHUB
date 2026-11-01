@@ -415,12 +415,9 @@ end
 local function memStep(model)
     local part = partOfKind(model, mem.kind)
     local tAddr = addrOf(part)
+    -- the target must still exist (model and part still parented). Health is NOT checked:
+    -- knocked players sit at 0 health but are still in the game and can be spectated.
     if not tAddr or not prop(part, "Parent") or not prop(model, "Parent") then return false end
-    local hum = model:FindFirstChildOfClass("Humanoid")
-    if hum then
-        local hp = prop(hum, "Health")
-        if type(hp) == "number" and hp <= 0 then return false end
-    end
     local camAddr = addrOf(Workspace.CurrentCamera)
     if camAddr ~= sub.camAddr then return false end
     if readPtr(camAddr + mem.offset) ~= tAddr then
