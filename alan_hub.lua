@@ -217,7 +217,7 @@ local function renderTab(tab)
         es:Toggle("rl_esp_alert", "Phoenix Down alert", DEFAULTS.esp_alert)
         es:Tip("Sound: turn on Notification sound in Matcha's options")
         es:Button("Test alert", function()
-            if phoenixAlert then phoenixAlert("test - X:0 Y:0 Z:0") end
+            if phoenixAlert then phoenixAlert("Test - somewhere, 120m away") end
         end)
         es:SliderInt("rl_esp_range", "Range", 10, 300, DEFAULTS.esp_range)
         es:SliderInt("rl_esp_max", "Max shown", 5, 100, DEFAULTS.esp_max)
@@ -829,9 +829,9 @@ end
 -- Phoenix Down alert: the drawn popup plus a Matcha notification. Matcha cannot create
 -- Sound objects (no Instance.new), but its notifications play a sound when "Notification
 -- sound" is enabled in Matcha's options.
-phoenixAlert = function(posStr)
-    pcall(drawNotif, "Phoenix Down", posStr, RARITY_STYLE.artifact.Color)
-    pcall(notify, "Phoenix Down / Azael Horn - " .. posStr, "Alan Hub", 6)
+phoenixAlert = function(where)
+    pcall(drawNotif, "Phoenix Down / Azael Horn", where, RARITY_STYLE.artifact.Color)
+    pcall(notify, "Phoenix Down / Azael Horn - " .. where, "Alan Hub", 6)
 end
 
 -- ESP objects
@@ -850,11 +850,7 @@ local function removeEsp(e)
     e.removed = true
 end
 
-local function newLine(color, zi, thick)
-    local l = Drawing.new("Line")
-    l.Thickness = thick; l.Color = color; l.ZIndex = zi; l.Visible = false
-    return l
-end
+local AREA_COLOR = Color3.fromRGB(170, 170, 180)
 
 local function addTrinketEsp(trinket, name, rarity)
     local addr = addrOf(trinket)
@@ -862,35 +858,45 @@ local function addTrinketEsp(trinket, name, rarity)
     local style = RARITY_STYLE[rarity] or RARITY_STYLE.common
     local color, zi = style.Color, style.ZIndex + 10
     local isPhoenix = (name == "Phoenix Down / Azael Horn")
+    local area = detectTrinketArea(trinket)
 
     if isPhoenix and ui("esp_alert") then
+        local where = (area ~= "None") and area or "unknown area"
         local pos = safeRead(function() return trinket.Position end)
-        local posStr = pos and ("X:" .. math.floor(pos.X) .. " Y:" .. math.floor(pos.Y) .. " Z:" .. math.floor(pos.Z))
-            or "unknown position"
-        phoenixAlert(posStr)
+        local char = prop(LocalPlayer, "Character")
+        local root = char and (char:FindFirstChild("HumanoidRootPart") or char:FindFirstChild("Torso"))
+        if pos and root then
+            where = where .. ", " .. math.floor((pos - root.Position).Magnitude) .. "m away"
+        end
+        phoenixAlert(where)
     end
 
+    -- Artifacts and Mythics get a slightly bigger dot
+    local big = (rarity == "artifact" or rarity == "mythic")
+    local radius = big and 4 or 3
+
     local dot = Drawing.new("Circle")
-    dot.Radius = 4; dot.NumSides = 12; dot.Filled = true
+    dot.Radius = radius; dot.NumSides = 12; dot.Filled = true
     dot.Color = color; dot.ZIndex = zi; dot.Visible = false
 
     local dotOutline = Drawing.new("Circle")
-    dotOutline.Radius = 5; dotOutline.NumSides = 12; dotOutline.Filled = false
+    dotOutline.Radius = radius + 1; dotOutline.NumSides = 12; dotOutline.Filled = false
     dotOutline.Thickness = 1; dotOutline.Color = Color3.fromRGB(0, 0, 0)
     dotOutline.ZIndex = zi - 1; dotOutline.Visible = false
 
-    local line = newLine(color, zi, 1)
-
-    local label = Drawing.new("Text")
+    local label = Drawing.new("Text")                 -- "Name  42m" in the rarity colour
     label.Center = true; label.Outline = true; label.Font = Drawing.Fonts.SystemBold
     label.Size = 13; label.Color = color; label.ZIndex = zi + 1; label.Visible = false
 
+    local areaLabel = Drawing.new("Text")             -- area, small and grey
+    areaLabel.Center = true; areaLabel.Outline = true; areaLabel.Font = Drawing.Fonts.System
+    areaLabel.Size = 11; areaLabel.Color = AREA_COLOR; areaLabel.ZIndex = zi + 1; areaLabel.Visible = false
 
     local e = {
         object = trinket, addr = addr, name = name, rarity = rarity, isPhoenix = isPhoenix,
-        area = detectTrinketArea(trinket),
-        dot = dot, dotOutline = dotOutline, line = line, label = label,
-        parts = { dot, dotOutline, line, label },
+        area = area,
+        dot = dot, dotOutline = dotOutline, label = label, areaLabel = areaLabel,
+        parts = { dot, dotOutline, label, areaLabel },
         visible = false, lastText = "", lastTextTime = 0,
         dist = math.huge, pos = nil, removed = false, nextCheck = 0,
     }
@@ -926,22 +932,26 @@ local function drawEsp(e, cfg)
 
     local now = clock()
     if now - e.lastTextTime >= 0.2 then
-        local areaStr = ""
-        if cfg.area and e.area ~= "None" then areaStr = "\n(" .. e.area .. ")" end
-        local posStr = ""
-        if e.isPhoenix then
-            posStr = "\n" .. math.floor(e.pos.X) .. ", " .. math.floor(e.pos.Y) .. ", " .. math.floor(e.pos.Z)
-        end
-        e.lastText = e.name .. "\n" .. math.floor(e.dist) .. "m" .. areaStr .. posStr
+        e.lastText = e.name .. "  " .. math.floor(e.dist) .. "m"
         e.lastTextTime = now
     end
+    local showArea = cfg.area and e.area ~= "None"
 
-    local lp = clampScreen(Vector2.new(sp.X, math.max(0, sp.Y - 28)))
-    if not lp then hideEsp(e); return end
+    -- label just above the dot; the area line sits between them when shown
+    local nameY = sp.Y - (showArea and 30 or 18)
+    local np = clampScreen(Vector2.new(sp.X, math.max(0, nameY)))
+    if not np then hideEsp(e); return end
+
     e.dot.Position = sp; e.dot.Visible = true
     e.dotOutline.Position = sp; e.dotOutline.Visible = true
-    e.line.From = sp; e.line.To = lp; e.line.Visible = true
-    e.label.Text = e.lastText; e.label.Position = lp; e.label.Visible = true
+    e.label.Text = e.lastText; e.label.Position = np; e.label.Visible = true
+    if showArea then
+        e.areaLabel.Text = e.area
+        e.areaLabel.Position = Vector2.new(np.X, np.Y + 14)
+        e.areaLabel.Visible = true
+    else
+        e.areaLabel.Visible = false
+    end
     e.visible = true
 end
 
