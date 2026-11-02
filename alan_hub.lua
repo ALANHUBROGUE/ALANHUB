@@ -10,6 +10,7 @@
 --            "Stop spectating" button in the menu. Needs Unsafe Lua enabled in Matcha.
 -- Trinket ESP: on/off, range, max shown, types and "ignore range" are in the menu.
 -- No hotkeys. Silent: nothing is printed unless the menu tab fails to load.
+-- Settings are saved to <Matcha workspace>/AlanHub/config.cfg and loaded on start.
 
 ----------------------------------------------------------------------
 -- Services / single instance
@@ -53,6 +54,70 @@ local function ui(id)
     local ok, v = pcall(UI.GetValue, "rl_" .. id)
     if ok and v ~= nil then return v end
     return d
+end
+
+----------------------------------------------------------------------
+-- Config: saved to <Matcha workspace>/AlanHub/config.cfg (key=value lines)
+-- Loaded before the menu is built; saved automatically whenever a setting changes.
+----------------------------------------------------------------------
+local CONFIG_FILE = "AlanHub/config.cfg"
+local FACTORY = {}
+for k, v in pairs(DEFAULTS) do FACTORY[k] = v end
+local configLoaded = false
+
+local function loadConfig()
+    local ok, text = pcall(function()
+        if not isfile(CONFIG_FILE) then return nil end
+        return readfile(CONFIG_FILE)
+    end)
+    if not ok or type(text) ~= "string" then return end
+    for line in text:gmatch("[^\r\n]+") do
+        local k, v = line:match("^%s*([%w_]+)%s*=%s*(.-)%s*$")
+        if k and FACTORY[k] ~= nil then
+            if type(FACTORY[k]) == "boolean" then
+                if v == "true" then DEFAULTS[k] = true elseif v == "false" then DEFAULTS[k] = false end
+            elseif type(FACTORY[k]) == "number" then
+                local n = tonumber(v)
+                if n then DEFAULTS[k] = n end
+            end
+        end
+    end
+    configLoaded = true
+end
+pcall(loadConfig)
+
+local function sortedKeys()
+    local keys = {}
+    for k in pairs(FACTORY) do keys[#keys + 1] = k end
+    table.sort(keys)
+    return keys
+end
+
+local lastSaved = nil
+local function currentConfigText()
+    local lines = { "-- Alan Hub settings (saved automatically)" }
+    for _, k in ipairs(sortedKeys()) do
+        lines[#lines + 1] = k .. "=" .. tostring(ui(k))
+    end
+    return table.concat(lines, "\n")
+end
+
+local function saveConfig(force)
+    if not uiReady then return end                -- menu values are only real once it exists
+    local text = currentConfigText()
+    if not force and text == lastSaved then return end
+    if pcall(writefile, CONFIG_FILE, text) then lastSaved = text end
+end
+
+-- push the loaded (or factory) values into the menu widgets
+local function applyToMenu(values)
+    for k, v in pairs(values) do pcall(UI.SetValue, "rl_" .. k, v) end
+end
+
+local function resetConfig()
+    for k, v in pairs(FACTORY) do DEFAULTS[k] = v end
+    applyToMenu(FACTORY)
+    saveConfig(true)
 end
 
 
@@ -140,6 +205,11 @@ local function renderTab(tab)
         if printLoot then printLoot() end
     end)
 
+    local cf = tab:Section("Config", "Left")
+    cf:Tip("Settings save automatically and load when the hub starts")
+    cf:Button("Save now", function() saveConfig(true) end)
+    cf:Button("Reset to defaults", function() resetConfig() end)
+
     local es = tab:Section("Trinket ESP", "Right", { "Main", "Types", "Ignore range" })
     if es.page == 0 then
         es:Toggle("rl_esp_enabled", "Trinket ESP", DEFAULTS.esp_enabled)
@@ -166,9 +236,14 @@ if UI == nil then
     warn("[Alan Hub] Matcha's UI library is not available on this build - menu tab not added (features still run with defaults)")
 else
     local okTab, errTab = pcall(function()
+        local applied = false
         UI.AddTab(TAB_NAME, function(tab)
             uiReady = true
             local ok, err = pcall(renderTab, tab)
+            if ok and not applied then
+                applied = true
+                if configLoaded then applyToMenu(DEFAULTS) end   -- saved settings beat remembered ones
+            end
             if not ok and not menuError then
                 menuError = tostring(err)
                 warn("[Alan Hub] menu tab error: " .. menuError)
@@ -1207,7 +1282,7 @@ end
 --====================================================================
 -- MAIN LOOP
 --====================================================================
-local espNext, statusNext = 0, 0
+local espNext, statusNext, configNext = 0, 0, 0
 
 local function onFrame()
     if _G.AlanHubGen ~= GEN then return end
@@ -1228,6 +1303,11 @@ local function onFrame()
     if now >= statusNext then
         statusNext = now + 0.5
         setField("rl_viri_status", viri.status)
+    end
+
+    if now >= configNext then
+        configNext = now + 2
+        pcall(saveConfig, false)
     end
 end
 
@@ -1257,6 +1337,7 @@ end)
 -- CLEANUP (re-running the script calls this first)
 --====================================================================
 local function cleanup()
+    pcall(saveConfig, false)
     _G.AlanHubGen = nil
     pcall(function() frameConn:Disconnect() end)
     pcall(memRestore)
