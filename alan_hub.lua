@@ -871,19 +871,6 @@ local function addTrinketEsp(trinket, name, rarity)
         phoenixAlert(where)
     end
 
-    -- Artifacts and Mythics get a slightly bigger dot
-    local big = (rarity == "artifact" or rarity == "mythic")
-    local radius = big and 4 or 3
-
-    local dot = Drawing.new("Circle")
-    dot.Radius = radius; dot.NumSides = 12; dot.Filled = true
-    dot.Color = color; dot.ZIndex = zi; dot.Visible = false
-
-    local dotOutline = Drawing.new("Circle")
-    dotOutline.Radius = radius + 1; dotOutline.NumSides = 12; dotOutline.Filled = false
-    dotOutline.Thickness = 1; dotOutline.Color = Color3.fromRGB(0, 0, 0)
-    dotOutline.ZIndex = zi - 1; dotOutline.Visible = false
-
     local label = Drawing.new("Text")                 -- "Name  42m" in the rarity colour
     label.Center = true; label.Outline = true; label.Font = Drawing.Fonts.SystemBold
     label.Size = 13; label.Color = color; label.ZIndex = zi + 1; label.Visible = false
@@ -895,8 +882,8 @@ local function addTrinketEsp(trinket, name, rarity)
     local e = {
         object = trinket, addr = addr, name = name, rarity = rarity, isPhoenix = isPhoenix,
         area = area,
-        dot = dot, dotOutline = dotOutline, label = label, areaLabel = areaLabel,
-        parts = { dot, dotOutline, label, areaLabel },
+        label = label, areaLabel = areaLabel,
+        parts = { label, areaLabel },
         visible = false, lastText = "", lastTextTime = 0,
         dist = math.huge, pos = nil, removed = false, nextCheck = 0,
     }
@@ -937,13 +924,11 @@ local function drawEsp(e, cfg)
     end
     local showArea = cfg.area and e.area ~= "None"
 
-    -- label just above the dot; the area line sits between them when shown
-    local nameY = sp.Y - (showArea and 30 or 18)
+    -- label centred on the trinket; the area line sits just under the name when shown
+    local nameY = sp.Y - (showArea and 16 or 8)
     local np = clampScreen(Vector2.new(sp.X, math.max(0, nameY)))
     if not np then hideEsp(e); return end
 
-    e.dot.Position = sp; e.dot.Visible = true
-    e.dotOutline.Position = sp; e.dotOutline.Visible = true
     e.label.Text = e.lastText; e.label.Position = np; e.label.Visible = true
     if showArea then
         e.areaLabel.Text = e.area
