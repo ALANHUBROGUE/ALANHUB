@@ -518,7 +518,10 @@ end
 --====================================================================
 local vpW, vpH = 1920, 1080
 
+local viewportNext = 0
 local function refreshViewport()
+    if tick() < viewportNext then return end
+    viewportNext = tick() + 1
     local cam = Workspace.CurrentCamera
     if not cam then return end
     local vp = prop(cam, "ViewportSize")
@@ -814,36 +817,42 @@ local function addTrinketEsp(trinket, name, rarity)
         dot = dot, dotOutline = dotOutline, line = line, label = label,
         parts = { dot, dotOutline, line, label },
         visible = false, lastText = "", lastTextTime = 0,
-        dist = math.huge, pos = nil, removed = false,
+        dist = math.huge, pos = nil, removed = false, nextCheck = 0,
     }
     espList[#espList + 1] = e
     espByAddress[addr] = e
 end
 
--- false = do not draw; removes the ESP when the trinket is gone
-local function precheck(e, camPos, maxRange)
-    if prop(e.object, "Parent") == nil then
-        hideEsp(e)
-        removeEsp(e)
-        return false
+-- false = do not draw; removes the ESP when the trinket is gone.
+-- Trinkets do not move: "still there?" and the position are re-read ESP_RECHECK times per
+-- second per trinket (not every frame) and the cached position is used in between.
+local ESP_RECHECK = 0.25
+local function precheck(e, camPos, maxRange, now, cfg)
+    if now >= e.nextCheck or not e.pos then
+        e.nextCheck = now + ESP_RECHECK
+        if prop(e.object, "Parent") == nil then
+            hideEsp(e)
+            removeEsp(e)
+            return false
+        end
+        local pos = safeRead(function() return e.object.CFrame.Position end)
+        if not pos then hideEsp(e); return false end
+        e.pos = pos
     end
-    local pos = safeRead(function() return e.object.CFrame.Position end)
-    if not pos then hideEsp(e); return false end
-    e.pos = pos
-    e.dist = (camPos - pos).Magnitude
-    if not ui("types_" .. e.rarity) then hideEsp(e); return false end
-    if not ui("far_" .. e.rarity) and e.dist >= maxRange then hideEsp(e); return false end
+    e.dist = (camPos - e.pos).Magnitude
+    if not cfg.types[e.rarity] then hideEsp(e); return false end
+    if not cfg.far[e.rarity] and e.dist >= maxRange then hideEsp(e); return false end
     return true
 end
 
-local function drawEsp(e)
+local function drawEsp(e, cfg)
     local sp = safeWorldToScreen(e.pos)
     if not sp then hideEsp(e); return end
 
     local now = clock()
     if now - e.lastTextTime >= 0.2 then
         local areaStr = ""
-        if ui("esp_area") and e.area ~= "None" then areaStr = "\n(" .. e.area .. ")" end
+        if cfg.area and e.area ~= "None" then areaStr = "\n(" .. e.area .. ")" end
         local posStr = ""
         if e.isPhoenix then
             posStr = "\n" .. math.floor(e.pos.X) .. ", " .. math.floor(e.pos.Y) .. ", " .. math.floor(e.pos.Z)
@@ -868,19 +877,18 @@ local function scanTrinkets()
     local rootPos = root.Position
     local limit = ui("esp_range") + 20
     for _, v in ipairs(Workspace:GetChildren()) do
-        local ok = pcall(function()
-            if (v:IsA("BasePart") or v:IsA("UnionOperation"))
-                and v.Name == "Part"
-                and v:FindFirstChild("ID")
+        -- same conditions as before, cheapest first: the name is one read and rules out
+        -- almost everything in workspace before the heavier checks run
+        pcall(function()
+            if v.Name == "Part"
                 and not espByAddress[addrOf(v) or 0]
-                and (v.Position - rootPos).Magnitude <= limit then
+                and (v:IsA("BasePart") or v:IsA("UnionOperation"))
+                and (v.Position - rootPos).Magnitude <= limit
+                and v:FindFirstChild("ID") then
                 local name, rarity = identifyTrinket(v)
                 if name then addTrinketEsp(v, name, rarity) end
             end
         end)
-        if not ok then
-            -- skip this object
-        end
     end
 end
 
@@ -894,11 +902,19 @@ local function espFrame()
     local camPos = cam.CFrame.Position
     local maxRange = ui("esp_range")
     local maxDraw = ui("esp_max")
+    local now = tick()
+
+    -- menu settings once per frame, not once per trinket
+    local cfg = { types = {}, far = {}, area = ui("esp_area") }
+    for _, r in ipairs(RARITIES) do
+        cfg.types[r] = ui("types_" .. r)
+        cfg.far[r] = ui("far_" .. r)
+    end
 
     local candidates = {}
     for _, e in ipairs(espList) do
         if not e.removed then
-            local ok, pass = pcall(precheck, e, camPos, maxRange)
+            local ok, pass = pcall(precheck, e, camPos, maxRange, now, cfg)
             if ok and pass then candidates[#candidates + 1] = e end
         end
     end
@@ -906,7 +922,7 @@ local function espFrame()
 
     for i, e in ipairs(candidates) do
         if enabled and i <= maxDraw then
-            pcall(drawEsp, e)
+            pcall(drawEsp, e, cfg)
         else
             hideEsp(e)
         end
