@@ -678,51 +678,95 @@ local RARITY_STYLE = {
     event    = { Color = Color3.fromRGB( 50, 205,  50), ZIndex = 5 },
 }
 
+-- Trinket identification, ported from the big hub script's identify_trinket as far as
+-- Matcha can read it (documented: ClassName, children, BasePart.Color, MeshPart.MeshId).
+-- Its AssetId checks (hidden property) and ParticleEmitter colour checks cannot be read.
+local GEM_MESH = "2877143560"
+
+local function digitsOf(s)
+    if type(s) ~= "string" then return nil end
+    return (s:gsub("%%20", "")):match("%d+")
+end
+
+-- MeshId as a number string: the documented property first, the old memory offset as backup
+local function meshIdOf(inst)
+    if not inst then return nil end
+    local d = digitsOf(prop(inst, "MeshId"))
+    if d then return d end
+    if prop(inst, "ClassName") == "MeshPart" then return readMeshId(inst) end
+    return nil
+end
+
+local function rgbOf(v)
+    local c = prop(v, "Color")
+    if not c then return nil end
+    local ok, r, g, b = pcall(function() return c.R * 255, c.G * 255, c.B * 255 end)
+    if ok and type(r) == "number" then return r, g, b end
+    return nil
+end
+
+local function near(r, g, b, R, G, B)
+    return math.abs(r - R) <= 3 and math.abs(g - G) <= 3 and math.abs(b - B) <= 3
+end
+
+-- gems share one mesh; the big script tells them apart by the part's colour
+local function gemByColor(v)
+    local r, g, b = rgbOf(v)
+    if not r then return "Gem", "rare" end
+    if near(r, g, b, 230, 29, 248) then return "Rift Gem", "mythic" end
+    if near(r, g, b, 164, 187, 190) then return "Diamond", "rare" end
+    if g > r and g > b then return "Emerald", "rare" end
+    if r > g and r > b then return "Ruby", "rare" end
+    if b > r and b > g then return "Sapphire", "rare" end
+    return "Gem", "rare"
+end
+
 -- returns name, rarity
 local function identifyTrinket(v)
     local cls = prop(v, "ClassName")
     if not cls then return nil end
 
-    local hasAttachment  = v:FindFirstChild("Attachment") ~= nil
-    local hasOrbParticle = v:FindFirstChild("OrbParticle") ~= nil
-    local hasSpecialMesh = v:FindFirstChildOfClass("SpecialMesh") ~= nil
-    local hasDirectPE    = v:FindFirstChildOfClass("ParticleEmitter") ~= nil
-
-    local meshChildCount = 0
-    for _, c in ipairs(v:GetChildren()) do
-        if prop(c, "ClassName") == "MeshPart" then meshChildCount = meshChildCount + 1 end
-    end
-
-    local attHasPE = false
-    if hasAttachment then
-        local att = v:FindFirstChild("Attachment")
-        for _, c in ipairs(att:GetChildren()) do
-            if prop(c, "ClassName") == "ParticleEmitter" then attHasPE = true end
-        end
-    end
-
-    if cls == "MeshPart" then
-        local mid = readMeshId(v)
-        local entry = mid and MESH_ID_MAP[mid]
-        if entry then return entry.name, entry.rarity end
-        if meshChildCount > 0 then
-            if v:FindFirstChildOfClass("Weld") ~= nil or meshChildCount >= 2 then return "Scroll", "rare" end
-            return "Amulet", "common"
-        end
-        if hasAttachment and hasDirectPE then return "Amulet", "common" end
-        return "Trinket", "common"
-    end
-
-    if cls == "Part" then
-        if hasSpecialMesh and hasOrbParticle then return "???", "rare" end
-        if hasOrbParticle and not hasSpecialMesh then return "Ice Essence", "rare" end
-        if hasSpecialMesh and not hasOrbParticle then return "Opal", "rare" end
-        if hasAttachment and attHasPE then return "Phoenix Down / Azael Horn", "artifact" end
-        if hasDirectPE and not hasSpecialMesh and not hasAttachment then return "Rift Gem", "mythic" end
-    end
+    local pe    = v:FindFirstChildOfClass("ParticleEmitter")
+    local orb   = v:FindFirstChild("OrbParticle")
+    local sm    = v:FindFirstChildOfClass("SpecialMesh")
+    local att   = v:FindFirstChild("Attachment")
+    local attPE = att and att:FindFirstChildOfClass("ParticleEmitter")
 
     if cls == "UnionOperation" then return "Idol", "common" end
-    return nil
+
+    if cls == "MeshPart" then
+        local mid = meshIdOf(v)
+        if mid == GEM_MESH then return gemByColor(v) end
+        local entry = mid and MESH_ID_MAP[mid]
+        if entry then return entry.name, entry.rarity end
+        local r, g, b = rgbOf(v)
+        if r and near(r, g, b, 27, 42, 53) then return "Night Stone", "artifact" end   -- BrickColor "Black"
+    end
+
+    if cls == "Part" and sm and orb then return "???", "rare" end
+
+    if cls == "Part" and sm and pe then
+        local smId = meshIdOf(sm)
+        if smId == GEM_MESH then return gemByColor(v) end
+        if smId == nil then
+            -- mesh id not readable: the colour still identifies the rare gems
+            local name, rarity = gemByColor(v)
+            if name == "Rift Gem" or name == "Diamond" then return name, rarity end
+        end
+        return "Opal", "common"
+    end
+
+    if attPE then
+        local rate = tonumber(prop(attPE, "Rate"))
+        if rate == 3 then return "Mysterious Artifact", "mythic" end
+        return "Phoenix Down / Azael Horn", "artifact"
+    end
+
+    if cls == "Part" and pe and not sm then return "Rift Gem", "mythic" end   -- big script: odd particle colour
+    if cls == "Part" and orb then return "Ice Essence", "rare" end
+
+    if cls == "MeshPart" then return "Trinket", "common" end
+    return "Opal", "common"                 -- the big script's default for anything unmatched
 end
 
 local function detectTrinketArea(trinket)
