@@ -225,6 +225,7 @@ local function renderTab(tab)
     pe:Tip("Learned from the leaderboard. Grey = username, in-game name not known yet")
     pe:Toggle("rl_pesp_distance", "Distance", DEFAULTS.pesp_distance)
     pe:SliderInt("rl_pesp_dist", "Max distance", 100, 5000, DEFAULTS.pesp_dist)
+    pe:InputText("rl_pesp_status", "ESP status", "...")
 
     local es = tab:Section("Trinket ESP", "Right", { "Main", "Types", "Ignore range" })
     if es.page == 0 then
@@ -1053,6 +1054,8 @@ local PESP_UNKNOWN = Color3.fromRGB(165, 165, 175)
 local PESP_DIST    = Color3.fromRGB(190, 190, 200)
 
 local pespDraw = {}     -- [username] = drawings
+local pespStatus = "..."
+local pespError = nil   -- first error seen, shown in the status field
 local pespState = {}    -- [username] = { model, root, hum, hp, maxHp, nextRefs, nextHp }
 
 local function pespSquare(filled, thick, color, zi)
@@ -1139,17 +1142,17 @@ local function pespPlayer(p, uname, now, camPos, cfg)
         st.hum = model and model:FindFirstChildOfClass("Humanoid")
     end
     local root = st.root
-    if not root then pespHide(uname) return end
+    if not root then pespHide(uname) return "nochar" end
 
     local rp = root.Position
     local dist = (rp - camPos).Magnitude
-    if dist > cfg.maxDist then pespHide(uname) return end
+    if dist > cfg.maxDist then pespHide(uname) return "far" end
 
     local top, onTop = WorldToScreen(rp + Vector3.new(0, 3, 0))
     local bottom, onBottom = WorldToScreen(rp - Vector3.new(0, 3.5, 0))
-    if not onTop or not onBottom then pespHide(uname) return end
+    if not onTop or not onBottom then pespHide(uname) return "offscreen" end
     local h = bottom.Y - top.Y
-    if h < 6 then pespHide(uname) return end
+    if h < 6 then pespHide(uname) return "offscreen" end
     local w = h * 0.55
     local x, y = top.X - w / 2, top.Y
 
@@ -1200,11 +1203,13 @@ local function pespPlayer(p, uname, now, camPos, cfg)
     else
         c.dist.Visible = false
     end
+    return "drawn"
 end
 
 local function playerEspFrame()
     if not ui("pesp_on") then
         for uname in pairs(pespDraw) do pespRemove(uname) end
+        pespStatus = "off"
         return
     end
     local cam = Workspace.CurrentCamera
@@ -1217,14 +1222,25 @@ local function playerEspFrame()
     }
 
     local seen = {}
+    local total, chars, drawn, errors = 0, 0, 0, 0
     for _, p in ipairs(Players:GetPlayers()) do
         local uname = prop(p, "Name")
         if uname and uname ~= LocalPlayer.Name then
             seen[uname] = true
-            local ok = pcall(pespPlayer, p, uname, now, camPos, cfg)
-            if not ok then pespHide(uname) end
+            total = total + 1
+            local ok, res = pcall(pespPlayer, p, uname, now, camPos, cfg)
+            if not ok then
+                errors = errors + 1
+                if not pespError then pespError = tostring(res) end
+                pcall(pespHide, uname)
+            else
+                if res ~= "nochar" then chars = chars + 1 end
+                if res == "drawn" then drawn = drawn + 1 end
+            end
         end
     end
+    pespStatus = "players " .. total .. " | spawned " .. chars .. " | drawn " .. drawn
+    if errors > 0 then pespStatus = pespStatus .. " | ERROR: " .. tostring(pespError) end
     for uname in pairs(pespDraw) do
         if not seen[uname] then pespRemove(uname) end       -- left the server
     end
@@ -1515,7 +1531,8 @@ local function onFrame()
     pcall(viribusFrame, active)
 
     pcall(spectateFrame, active)
-    pcall(playerEspFrame)
+    local okP, errP = pcall(playerEspFrame)
+    if not okP then pespStatus = "ERROR: " .. tostring(errP) end
 
     local now = tick()
     if now >= espNext then                  -- ESP at most 30x/s keeps every frame short
@@ -1527,6 +1544,7 @@ local function onFrame()
     if now >= statusNext then
         statusNext = now + 0.5
         setField("rl_viri_status", viri.status)
+        setField("rl_pesp_status", pespStatus)
     end
 
     if now >= configNext then
