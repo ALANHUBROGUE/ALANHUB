@@ -1,6 +1,7 @@
 -- Alan Hub - Rogue Lineage (Matcha LuaVM)
 --   * Leaderboard spectate (silent)
 --   * Trinket ESP
+--   * Player ESP: box, health bar, IN-GAME name (learned from the leaderboard), distance
 --   * Last looted timers (Castle Rock, Temple of Fire, Deep Sunken, Crypt of Kings)
 --   * Anti backfire Viribus (no Pro needed): spams F when a left-click Viribus will backfire
 -- Settings live in Matcha's menu, tab "Alan Hub".
@@ -41,6 +42,12 @@ local DEFAULTS = {
     esp_alert     = true,
     esp_range     = 200,
     esp_max       = 60,
+    pesp_on       = true,
+    pesp_box      = true,
+    pesp_hp       = true,
+    pesp_name     = true,
+    pesp_distance = true,
+    pesp_dist     = 2000,
     types_common  = false, types_rare = false, types_mythic = true, types_artifact = true, types_event = false,
     viri_on       = false,
     viri_time     = 900,    -- ms of F spam at most
@@ -210,6 +217,15 @@ local function renderTab(tab)
     cf:Button("Save now", function() saveConfig(true) end)
     cf:Button("Reset to defaults", function() resetConfig() end)
 
+    local pe = tab:Section("Player ESP", "Right")
+    pe:Toggle("rl_pesp_on", "Player ESP", DEFAULTS.pesp_on)
+    pe:Toggle("rl_pesp_box", "Box", DEFAULTS.pesp_box)
+    pe:Toggle("rl_pesp_hp", "Health bar", DEFAULTS.pesp_hp)
+    pe:Toggle("rl_pesp_name", "In-game name", DEFAULTS.pesp_name)
+    pe:Tip("Learned from the leaderboard. Grey = username, in-game name not known yet")
+    pe:Toggle("rl_pesp_distance", "Distance", DEFAULTS.pesp_distance)
+    pe:SliderInt("rl_pesp_dist", "Max distance", 100, 5000, DEFAULTS.pesp_dist)
+
     local es = tab:Section("Trinket ESP", "Right", { "Main", "Types", "Ignore range" })
     if es.page == 0 then
         es:Toggle("rl_esp_enabled", "Trinket ESP", DEFAULTS.esp_enabled)
@@ -372,7 +388,20 @@ local function usernameSet()
 end
 
 local rowMemory = {}
-local rpgToUser = {}
+local rpgToUser = {}     -- [in-game name key] = username key
+local userToRpg = {}     -- [username key] = in-game name key
+local rpgDisplay = {}    -- [in-game name key] = in-game name as shown on the leaderboard
+
+local function cleanText(t)
+    t = (t:gsub("<[^>]->", ""))
+    t = (t:gsub("\226\128[\139-\143]", ""))
+    return t:match("^%s*(.-)%s*$")
+end
+
+local function learnPair(rpg, user)
+    rpgToUser[rpg] = user
+    userToRpg[user] = rpg
+end
 local nextSample = 0
 
 local function sampleRows()
@@ -391,11 +420,14 @@ local function sampleRows()
             end
             if users[k] then
                 m.user = k
-            elseif m.rpg ~= k then
-                m.rpg = k
-                m.user = nil
+            else
+                if m.rpg ~= k then
+                    m.rpg = k
+                    m.user = nil
+                end
+                rpgDisplay[k] = cleanText(r.text)
             end
-            if m.rpg and m.user then rpgToUser[m.rpg] = m.user end
+            if m.rpg and m.user then learnPair(m.rpg, m.user) end
         end
     end
 end
@@ -548,7 +580,7 @@ local function checkPending()
     end
     local k = norm(textOf(pending.node))
     if k and k ~= pending.key and usernameSet()[k] then
-        rpgToUser[pending.key] = k
+        learnPair(pending.key, k)
         local node = pending.node
         pending = nil
         handleKey(k, node)
@@ -1006,6 +1038,202 @@ local function espFrame()
 end
 
 --====================================================================
+-- PLAYER ESP
+-- Box with a dark outline, health bar (green -> red) on the left, IN-GAME name above, distance
+-- below. The in-game name comes from the leaderboard: a row shows the username while it is
+-- hovered, which links the two (the same learning spectate uses). Until a player's in-game
+-- name is known, their username is shown in grey.
+-- Per player: model / humanoid / root are looked up twice a second, health 5x a second, and
+-- only the position is read every frame.
+--====================================================================
+local PESP_BOX     = Color3.fromRGB(255, 255, 255)
+local PESP_OUTLINE = Color3.fromRGB(0, 0, 0)
+local PESP_NAME    = Color3.fromRGB(255, 255, 255)
+local PESP_UNKNOWN = Color3.fromRGB(165, 165, 175)
+local PESP_DIST    = Color3.fromRGB(190, 190, 200)
+
+local pespDraw = {}     -- [username] = drawings
+local pespState = {}    -- [username] = { model, root, hum, hp, maxHp, nextRefs, nextHp }
+
+local function pespSquare(filled, thick, color, zi)
+    local q = Drawing.new("Square")
+    q.Filled = filled
+    q.Thickness = thick
+    q.Color = color
+    q.ZIndex = zi
+    q.Visible = false
+    return q
+end
+
+local function pespText(size, color, font, zi)
+    local t = Drawing.new("Text")
+    t.Size = size
+    t.Color = color
+    t.Font = font
+    t.Center = true
+    t.Outline = true
+    t.ZIndex = zi
+    t.Visible = false
+    return t
+end
+
+local function pespGet(uname)
+    local c = pespDraw[uname]
+    if c then return c end
+    c = {
+        boxOutline = pespSquare(false, 3, PESP_OUTLINE, 1),
+        box        = pespSquare(false, 1, PESP_BOX, 2),
+        hpBack     = pespSquare(true, 1, PESP_OUTLINE, 1),
+        hpBar      = pespSquare(true, 1, Color3.fromRGB(80, 220, 100), 2),
+        name       = pespText(13, PESP_NAME, Drawing.Fonts.SystemBold, 3),
+        dist       = pespText(12, PESP_DIST, Drawing.Fonts.System, 3),
+    }
+    c.parts = { c.boxOutline, c.box, c.hpBack, c.hpBar, c.name, c.dist }
+    pespDraw[uname] = c
+    return c
+end
+
+local function pespHide(uname)
+    local c = pespDraw[uname]
+    if not c then return end
+    for _, d in ipairs(c.parts) do d.Visible = false end
+end
+
+local function pespRemove(uname)
+    local c = pespDraw[uname]
+    if c then
+        for _, d in ipairs(c.parts) do pcall(function() d:Remove() end) end
+    end
+    pespDraw[uname] = nil
+    pespState[uname] = nil
+end
+
+-- in-game name for a username (and whether it is really known)
+local function inGameName(uname)
+    local rpg = userToRpg[norm(uname) or ""]
+    if rpg then return rpgDisplay[rpg] or rpg, true end
+    return uname, false
+end
+
+local function hpColor(ratio)
+    if ratio < 0 then ratio = 0 elseif ratio > 1 then ratio = 1 end
+    -- red (230,60,60) -> green (80,220,100)
+    return Color3.fromRGB(
+        math.floor(230 + (80 - 230) * ratio),
+        math.floor(60 + (220 - 60) * ratio),
+        math.floor(60 + (100 - 60) * ratio))
+end
+
+local function pespPlayer(p, uname, now, camPos, cfg)
+    local st = pespState[uname]
+    if not st then
+        st = { nextRefs = 0, nextHp = 0 }
+        pespState[uname] = st
+    end
+
+    if now >= st.nextRefs then
+        st.nextRefs = now + 0.5
+        local model = getModel(uname) or prop(p, "Character")
+        st.model = model
+        st.root = model and (model:FindFirstChild("HumanoidRootPart") or model:FindFirstChild("Torso"))
+        st.hum = model and model:FindFirstChildOfClass("Humanoid")
+    end
+    local root = st.root
+    if not root then pespHide(uname) return end
+
+    local rp = root.Position
+    local dist = (rp - camPos).Magnitude
+    if dist > cfg.maxDist then pespHide(uname) return end
+
+    local top, onTop = WorldToScreen(rp + Vector3.new(0, 3, 0))
+    local bottom, onBottom = WorldToScreen(rp - Vector3.new(0, 3.5, 0))
+    if not onTop or not onBottom then pespHide(uname) return end
+    local h = bottom.Y - top.Y
+    if h < 6 then pespHide(uname) return end
+    local w = h * 0.55
+    local x, y = top.X - w / 2, top.Y
+
+    if st.hum and now >= st.nextHp then
+        st.nextHp = now + 0.2
+        st.hp = prop(st.hum, "Health")
+        st.maxHp = prop(st.hum, "MaxHealth")
+    end
+
+    local c = pespGet(uname)
+
+    if cfg.box then
+        c.boxOutline.Position = Vector2.new(x, y); c.boxOutline.Size = Vector2.new(w, h); c.boxOutline.Visible = true
+        c.box.Position = Vector2.new(x, y); c.box.Size = Vector2.new(w, h); c.box.Visible = true
+    else
+        c.boxOutline.Visible = false
+        c.box.Visible = false
+    end
+
+    local hp, maxHp = st.hp, st.maxHp
+    if cfg.hp and type(hp) == "number" and type(maxHp) == "number" and maxHp > 0 then
+        local ratio = hp / maxHp
+        if ratio < 0 then ratio = 0 elseif ratio > 1 then ratio = 1 end
+        local fill = math.floor(h * ratio)
+        c.hpBack.Position = Vector2.new(x - 6, y - 1); c.hpBack.Size = Vector2.new(4, h + 2); c.hpBack.Visible = true
+        c.hpBar.Position = Vector2.new(x - 5, y + h - fill); c.hpBar.Size = Vector2.new(2, fill)
+        c.hpBar.Color = hpColor(ratio)
+        c.hpBar.Visible = fill > 0
+    else
+        c.hpBack.Visible = false
+        c.hpBar.Visible = false
+    end
+
+    if cfg.name then
+        local shown, known = inGameName(uname)
+        c.name.Text = shown
+        c.name.Color = known and PESP_NAME or PESP_UNKNOWN
+        c.name.Position = Vector2.new(top.X, y - 16)
+        c.name.Visible = true
+    else
+        c.name.Visible = false
+    end
+
+    if cfg.dist then
+        c.dist.Text = math.floor(dist) .. "m"
+        c.dist.Position = Vector2.new(top.X, y + h + 2)
+        c.dist.Visible = true
+    else
+        c.dist.Visible = false
+    end
+end
+
+local function playerEspFrame()
+    if not ui("pesp_on") then
+        for uname in pairs(pespDraw) do pespRemove(uname) end
+        return
+    end
+    local cam = Workspace.CurrentCamera
+    if not cam then return end
+    local camPos = cam.CFrame.Position
+    local now = tick()
+    local cfg = {
+        box = ui("pesp_box"), hp = ui("pesp_hp"), name = ui("pesp_name"), dist = ui("pesp_distance"),
+        maxDist = tonumber(ui("pesp_dist")) or 2000,
+    }
+
+    local seen = {}
+    for _, p in ipairs(Players:GetPlayers()) do
+        local uname = prop(p, "Name")
+        if uname and uname ~= LocalPlayer.Name then
+            seen[uname] = true
+            local ok = pcall(pespPlayer, p, uname, now, camPos, cfg)
+            if not ok then pespHide(uname) end
+        end
+    end
+    for uname in pairs(pespDraw) do
+        if not seen[uname] then pespRemove(uname) end       -- left the server
+    end
+    for uname in pairs(pespState) do
+        if not seen[uname] then pespState[uname] = nil end
+    end
+end
+
+--====================================================================
 -- LAST LOOTED TIMERS
 -- Rogue Lineage stores, for every monster spawn trigger, when it last spawned its mobs:
 -- workspace.MonsterSpawns.Triggers.<trigger>.LastSpawned (a Unix timestamp, in seconds).
@@ -1287,6 +1515,7 @@ local function onFrame()
     pcall(viribusFrame, active)
 
     pcall(spectateFrame, active)
+    pcall(playerEspFrame)
 
     local now = tick()
     if now >= espNext then                  -- ESP at most 30x/s keeps every frame short
@@ -1341,6 +1570,7 @@ local function cleanup()
     espList = {}
     for _, n in ipairs(notifs) do pcall(removeNotif, n) end
     notifs = {}
+    for uname in pairs(pespDraw) do pcall(pespRemove, uname) end
     pcall(UI.RemoveTab, TAB_NAME)
 end
 
