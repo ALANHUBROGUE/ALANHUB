@@ -625,34 +625,9 @@ local function safeRead(fn)
     return nil
 end
 
-local MESHID_PTR_OFFSET = 0xF8
-
-local function readRobloxString(addr)
-    if not addr or addr == 0 then return nil end
-    local length = memory_read("uintptr_t", addr + 0x10)
-    if not length or length == 0 or length > 512 then return nil end
-    local dataPtr = length < 16 and addr or memory_read("uintptr_t", addr)
-    if not dataPtr or dataPtr == 0 then return nil end
-    local chars = {}
-    for i = 0, length - 1 do
-        local b = memory_read("byte", dataPtr + i)
-        if not b then break end
-        chars[#chars + 1] = string.char(b)
-    end
-    return table.concat(chars)
-end
-
-local function readMeshId(part)
-    if not part or prop(part, "ClassName") ~= "MeshPart" then return nil end
-    local base = addrOf(part)
-    if not base then return nil end
-    local ok, raw = pcall(function()
-        local meshIdPtr = memory_read("uintptr_t", base + MESHID_PTR_OFFSET)
-        if not meshIdPtr or meshIdPtr == 0 then return nil end
-        return readRobloxString(meshIdPtr)
-    end)
-    if not ok or not raw or raw == "" then return nil end
-    return raw:match("rbxassetid://(%d+)") or (raw:match("^%d+$") and raw) or nil
+local function digitsOf(s)
+    if type(s) ~= "string" then return nil end
+    return (s:gsub("%%20", "")):match("%d+")
 end
 
 local MESH_ID_MAP = {
@@ -670,6 +645,76 @@ local MESH_ID_MAP = {
     ["4027112893"] = { name = "Bound Book",               rarity = "rare"     },
 }
 
+-- MeshPart.MeshId read straight from memory (read-only). The field's offset moves with
+-- Roblox updates, so the hub finds it itself: on a trinket MeshPart it looks for an
+-- "rbxassetid://" text whose number is one of the known trinket meshes above. Only a known
+-- number counts, so it cannot lock onto another field such as the texture.
+local PREFIX = "rbxassetid://"
+local meshOffset = 0xF8          -- last known offset, tried first
+local meshOffsetOk = false       -- true once confirmed on a real trinket
+local meshScansLeft = 10         -- give up searching after this many trinkets
+
+local function plausiblePtr(a)
+    return type(a) == "number" and a > 0x10000 and a < 0x7FFFFFFFFFFF
+end
+
+-- reads a Roblox string struct at addr and returns the asset number, or nil
+local function assetDigitsAt(addr)
+    if not plausiblePtr(addr) then return nil end
+    local len = memory_read("uintptr_t", addr + 0x10)
+    if type(len) ~= "number" or len < 14 or len > 80 then return nil end
+    local data = addr
+    if len >= 16 then data = memory_read("uintptr_t", addr) end
+    if not plausiblePtr(data) then return nil end
+    for i = 1, #PREFIX do
+        local b = memory_read("byte", data + i - 1)
+        if b ~= string.byte(PREFIX, i) then return nil end
+    end
+    local chars = {}
+    for i = #PREFIX, len - 1 do
+        local b = memory_read("byte", data + i)
+        if type(b) ~= "number" then break end
+        chars[#chars + 1] = string.char(b)
+    end
+    return digitsOf(table.concat(chars))
+end
+
+-- the field can be a pointer to the string or the string itself
+local function meshDigitsAtOffset(base, off)
+    local ok, d = pcall(function()
+        local viaPtr = assetDigitsAt(memory_read("uintptr_t", base + off))
+        if viaPtr then return viaPtr end
+        return assetDigitsAt(base + off)
+    end)
+    if ok then return d end
+    return nil
+end
+
+local function knownMesh(d)
+    return d ~= nil and (MESH_ID_MAP[d] ~= nil or d == "2877143560")
+end
+
+local function readMeshId(part)
+    if not part or prop(part, "ClassName") ~= "MeshPart" then return nil end
+    local base = addrOf(part)
+    if not base then return nil end
+
+    local d = meshDigitsAtOffset(base, meshOffset)
+    if meshOffsetOk then return d end
+    if knownMesh(d) then meshOffsetOk = true return d end
+
+    if meshScansLeft <= 0 then return nil end
+    meshScansLeft = meshScansLeft - 1
+    for off = 0, 0x400, 8 do
+        local found = meshDigitsAtOffset(base, off)
+        if knownMesh(found) then
+            meshOffset, meshOffsetOk = off, true
+            return found
+        end
+    end
+    return nil
+end
+
 local RARITY_STYLE = {
     common   = { Color = Color3.fromRGB(200, 200, 200), ZIndex = 1 },
     rare     = { Color = Color3.fromRGB(100, 149, 237), ZIndex = 2 },
@@ -682,11 +727,6 @@ local RARITY_STYLE = {
 -- Matcha can read it (documented: ClassName, children, BasePart.Color, MeshPart.MeshId).
 -- Its AssetId checks (hidden property) and ParticleEmitter colour checks cannot be read.
 local GEM_MESH = "2877143560"
-
-local function digitsOf(s)
-    if type(s) ~= "string" then return nil end
-    return (s:gsub("%%20", "")):match("%d+")
-end
 
 -- MeshId as a number string: the documented property first, the old memory offset as backup
 local function meshIdOf(inst)
@@ -756,10 +796,12 @@ local function identifyTrinket(v)
         return "Opal", "common"
     end
 
-    if attPE then
+    -- only plain Parts, like the original script; amulets, scrolls and goblets are MeshParts
+    -- with sparkles on an Attachment too. A readable rate must be 5 (3 = Mysterious Artifact).
+    if cls == "Part" and attPE then
         local rate = tonumber(prop(attPE, "Rate"))
         if rate == 3 then return "Mysterious Artifact", "mythic" end
-        return "Phoenix Down / Azael Horn", "artifact"
+        if rate == nil or rate == 5 then return "Phoenix Down / Azael Horn", "artifact" end
     end
 
     if cls == "Part" and pe and not sm then return "Rift Gem", "mythic" end   -- big script: odd particle colour
