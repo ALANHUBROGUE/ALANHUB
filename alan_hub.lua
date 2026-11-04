@@ -766,7 +766,8 @@ local function identifyTrinket(v)
     local cls = prop(v, "ClassName")
     if not cls then return nil end
 
-    local pe    = v:FindFirstChildOfClass("ParticleEmitter")
+    -- by NAME like the big script: Ice Essence's "OrbParticle" is a ParticleEmitter too
+    local pe    = v:FindFirstChild("ParticleEmitter")
     local orb   = v:FindFirstChild("OrbParticle")
     local sm    = v:FindFirstChildOfClass("SpecialMesh")
     local att   = v:FindFirstChild("Attachment")
@@ -804,8 +805,8 @@ local function identifyTrinket(v)
         if rate == nil or rate == 5 then return "Phoenix Down / Azael Horn", "artifact" end
     end
 
+    if cls == "Part" and orb and not sm then return "Ice Essence", "rare" end
     if cls == "Part" and pe and not sm then return "Rift Gem", "mythic" end   -- big script: odd particle colour
-    if cls == "Part" and orb then return "Ice Essence", "rare" end
 
     if cls == "MeshPart" then return "Trinket", "common" end
     return "Opal", "common"                 -- the big script's default for anything unmatched
