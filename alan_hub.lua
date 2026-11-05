@@ -42,6 +42,8 @@ local DEFAULTS = {
     esp_range     = 200,
     esp_max       = 60,
     types_common  = false, types_rare = false, types_mythic = true, types_artifact = true, types_event = false,
+    pick_on       = false,
+    pick_phoenix  = false,
     viri_on       = false,
     viri_time     = 900,    -- ms of F spam at most
     far_common    = false, far_rare  = false, far_mythic  = true, far_artifact  = true, far_event  = false,
@@ -192,6 +194,13 @@ local function renderTab(tab)
     cb:Tip("Left-click Viribus at a backfire mana (not 25-35 / 60-75): spams F to block the pillar")
     cb:SliderInt("rl_viri_time", "Viribus spam time (ms)", 200, 1500, DEFAULTS.viri_time)
     cb:InputText("rl_viri_status", "Viribus status", "off")
+
+    local ap = tab:Section("Auto pickup", "Left")
+    ap:Toggle("rl_pick_on", "Auto trinket pickup (PRO)", DEFAULTS.pick_on)
+    ap:Tip("PRO NEEDED. Picks up every trinket you are within click range of")
+    ap:Toggle("rl_pick_phoenix", "Also Phoenix Down / Azael Horn", DEFAULTS.pick_phoenix)
+    ap:Tip("Off: skipped, because Azael Horn is skipped by the original and the two look the same here")
+    ap:InputText("rl_pick_status", "Pickup status", "off")
 
     local lt = tab:Section("Last looted", "Left")
     for i, a in ipairs(LOOT_AREAS) do
@@ -1362,6 +1371,105 @@ local function viribusFrame(active)
 end
 
 --====================================================================
+-- AUTO TRINKET PICKUP (PRO: needs fireclickdetector)
+-- Same idea as the big script's "Auto Trinket": every frame, every trinket Part (workspace
+-- child named "Part" with an "ID") whose distance is inside its ClickDetector's
+-- MaxActivationDistance gets its ClickDetector fired. Azael Horn is skipped.
+--====================================================================
+local pick = { list = {}, byAddr = {}, status = "off", nextScan = 0 }
+
+local function findClickDetector(v)
+    local cd = nil
+    pcall(function() cd = v:FindFirstChildOfClass("ClickDetector") end)
+    if cd then return cd end
+    pcall(function() cd = v:FindFirstChild("ClickDetector") end)
+    if cd then return cd end
+    pcall(function()
+        for _, d in ipairs(v:GetDescendants()) do
+            if prop(d, "ClassName") == "ClickDetector" then cd = d break end
+        end
+    end)
+    return cd
+end
+
+local function pickRescan()
+    local seen = {}
+    for _, v in ipairs(Workspace:GetChildren()) do
+        pcall(function()
+            if v.Name == "Part" and v:FindFirstChild("ID") then
+                local a = addrOf(v)
+                if a then
+                    seen[a] = true
+                    if not pick.byAddr[a] then
+                        local e = { part = v, addr = a, cd = findClickDetector(v), last = 0 }
+                        local name = identifyTrinket(v)
+                        e.skip = (name == "Phoenix Down / Azael Horn")
+                        pick.byAddr[a] = e
+                        pick.list[#pick.list + 1] = e
+                    end
+                end
+            end
+        end)
+    end
+    for i = #pick.list, 1, -1 do
+        local e = pick.list[i]
+        if not seen[e.addr] then
+            pick.byAddr[e.addr] = nil
+            table.remove(pick.list, i)
+        end
+    end
+end
+
+local PICK_GAP = 0.12            -- seconds between clicks on the same trinket
+
+local function pickupFrame()
+    if not ui("pick_on") then
+        if pick.status ~= "off" then pick.status = "off" end
+        return
+    end
+    if type(fireclickdetector) ~= "function" then
+        pick.status = "PRO NEEDED (no fireclickdetector)"
+        return
+    end
+    local char = prop(LocalPlayer, "Character")
+    local root = char and (char:FindFirstChild("HumanoidRootPart") or char:FindFirstChild("UpperTorso") or char:FindFirstChild("Torso"))
+    if not root then pick.status = "waiting for character" return end
+
+    local now = tick()
+    if now >= pick.nextScan then
+        pick.nextScan = now + 0.5
+        pickRescan()
+    end
+
+    local pos = root.Position
+    local withPhoenix = ui("pick_phoenix")
+    local clicked = 0
+    for _, e in ipairs(pick.list) do
+        if (withPhoenix or not e.skip) and now - e.last >= PICK_GAP then
+            local ok = pcall(function()
+                if not e.cd or not prop(e.cd, "Parent") then e.cd = findClickDetector(e.part) end
+                local cd = e.cd
+                if not cd then return end
+                local reach = tonumber(prop(cd, "MaxActivationDistance")) or 32
+                local dist = (e.part.Position - pos).Magnitude
+                if dist > 0 and dist < reach then
+                    e.last = now
+                    fireclickdetector(cd)
+                    clicked = clicked + 1
+                end
+            end)
+            if not ok then e.last = now end
+        end
+    end
+    if clicked > 0 then
+        pick.status = "picking up (" .. clicked .. ")"
+        pick.lastClick = now
+    elseif not pick.lastClick or now - pick.lastClick > 2 then
+        pick.status = "on - " .. #pick.list .. " trinkets around"
+    end
+end
+
+--====================================================================
 -- MAIN LOOP
 --====================================================================
 local espNext, statusNext, configNext = 0, 0, 0
@@ -1374,6 +1482,7 @@ local function onFrame()
     pcall(viribusFrame, active)
 
     pcall(spectateFrame, active)
+    pcall(pickupFrame)
 
     local now = tick()
     if now >= espNext then                  -- ESP at most 30x/s keeps every frame short
@@ -1385,6 +1494,7 @@ local function onFrame()
     if now >= statusNext then
         statusNext = now + 0.5
         setField("rl_viri_status", viri.status)
+        setField("rl_pick_status", pick.status)
     end
 
     if now >= configNext then
